@@ -1,0 +1,51 @@
+version: '3.8'
+
+# IPFS Storage Service (Single Container with Nostr Pinner)
+# Usage:
+#   SSL_CERT=/path/to/fullchain.pem SSL_KEY=/path/to/privkey.pem DOMAIN=example.com docker-compose up -d
+
+services:
+  # Main IPFS container with nginx WSS proxy and integrated nostr-pinner
+  ipfs:
+    build: .
+    image: ipfs-storage:latest
+    container_name: ipfs-kubo
+    restart: always
+    volumes:
+      - ipfs-data:/data/ipfs
+      # SSL certificates - must be provided via environment variables
+      - ${SSL_CERT:?SSL_CERT is required}:/etc/ssl/certs/fullchain.pem:ro
+      - ${SSL_KEY:?SSL_KEY is required}:/etc/ssl/private/privkey.pem:ro
+      # Optional: Initial pin list (only needed on first run, pins persist in volume)
+      - ${PIN_LIST:-/dev/null}:/data/pin-list.txt:ro
+    ports:
+      - "${PORT_SWARM:-4001}:4001/tcp"      # Swarm TCP
+      - "${PORT_SWARM:-4001}:4001/udp"      # Swarm UDP/QUIC
+      - "${PORT_WSS:-4003}:4003"            # WSS (TLS-terminated)
+      - "${PORT_HTTPS:-443}:443"            # HTTPS Gateway (set empty to disable)
+      - "${PORT_HTTP:-9080}:8080"           # HTTP Gateway
+      # Note: 5001 (API) is NOT exposed externally for security
+    environment:
+      # IPFS configuration
+      - DOMAIN=${DOMAIN:?DOMAIN is required}
+      - DEV_MODE=${DEV_MODE:-false}
+      - IPFS_PROFILE=${IPFS_PROFILE:-server}
+      - IPFS_LOGGING=${IPFS_LOGGING:-info}
+      # Nostr pinner configuration (integrated, Unicity relays)
+      - NOSTR_RELAYS=${NOSTR_RELAYS:-wss://nostr-relay.testnet.unicity.network,ws://unicity-nostr-relay-20250927-alb-1919039002.me-central-1.elb.amazonaws.com:8080}
+      - PIN_KIND=${PIN_KIND:-30078}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RECONNECT_DELAY=${RECONNECT_DELAY:-10}
+      - PIN_TIMEOUT=${PIN_TIMEOUT:-300}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  ipfs-data:
+    name: ipfs-data
+    # Use external: true if you have an existing volume
+    # external: true
