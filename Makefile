@@ -1,7 +1,7 @@
 # IPFS Storage Service Makefile
 # Easy commands for building, running, and managing the service
 
-.PHONY: build run stop logs shell info health clean dev
+.PHONY: build run stop logs shell info health clean dev compose-up compose-down compose-logs haproxy-up haproxy-down haproxy-logs
 
 # Configuration (override via CLI: make run DOMAIN=example.com SSL_CERT=/path/to/cert.pem)
 IMAGE_NAME ?= ipfs-storage
@@ -192,3 +192,28 @@ compose-down: ## Stop docker-compose stack
 
 compose-logs: ## View docker-compose logs
 	docker compose logs -f
+
+# HAProxy mode - runs behind HAProxy reverse proxy
+haproxy-up: ## Start behind HAProxy (SSL_CERT, SSL_KEY, DOMAIN required)
+	@if [ -z "$(SSL_CERT)" ] || [ -z "$(SSL_KEY)" ] || [ -z "$(DOMAIN)" ] || [ "$(DOMAIN)" = "localhost" ]; then \
+		echo "ERROR: SSL_CERT, SSL_KEY, and DOMAIN are required for HAProxy mode"; \
+		echo "Usage: make haproxy-up SSL_CERT=/path/to/fullchain.pem SSL_KEY=/path/to/privkey.pem DOMAIN=example.com"; \
+		exit 1; \
+	fi
+	@docker network inspect haproxy-net >/dev/null 2>&1 || \
+		(echo "ERROR: haproxy-net network does not exist. Create it with: docker network create haproxy-net"; exit 1)
+	@if [ -n "$(PIN_LIST)" ]; then \
+		echo "Pin list will be mounted from $(PIN_LIST)"; \
+	fi
+	@echo "HAProxy mode: Ports 80/443 NOT exposed (HAProxy handles external HTTPS)"
+	@echo "Ports: Swarm=$(PORT_SWARM) WSS=$(PORT_WSS) HTTP=$(PORT_HTTP)"
+	SSL_CERT=$(SSL_CERT) SSL_KEY=$(SSL_KEY) DOMAIN=$(DOMAIN) PIN_LIST=$(PIN_LIST) \
+		PORT_SWARM=$(PORT_SWARM) PORT_WSS=$(PORT_WSS) PORT_HTTP=$(PORT_HTTP) \
+		NOSTR_RELAYS="$(NOSTR_RELAYS)" PIN_KIND=$(PIN_KIND) LOG_LEVEL=$(LOG_LEVEL) \
+		docker compose -f docker-compose.haproxy.yml up -d
+
+haproxy-down: ## Stop HAProxy mode stack
+	docker compose -f docker-compose.haproxy.yml down
+
+haproxy-logs: ## View HAProxy mode logs
+	docker compose -f docker-compose.haproxy.yml logs -f

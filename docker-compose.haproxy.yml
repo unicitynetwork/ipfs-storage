@@ -1,0 +1,62 @@
+# IPFS Storage Service - HAProxy Mode
+# Runs behind HAProxy reverse proxy on haproxy-net network
+# Does NOT expose ports 80/443 publicly - HAProxy handles external HTTPS traffic
+#
+# Usage:
+#   SSL_CERT=/path/to/fullchain.pem SSL_KEY=/path/to/privkey.pem DOMAIN=example.com \
+#   docker compose -f docker-compose.haproxy.yml up -d
+
+services:
+  # Main IPFS container with nginx WSS proxy and integrated nostr-pinner
+  ipfs:
+    build: .
+    image: ipfs-storage:latest
+    # Container name MUST match haproxy.cfg backend configuration
+    container_name: ipfs-kubo
+    restart: always
+    volumes:
+      - ipfs-data:/data/ipfs
+      # SSL certificates - container handles its own TLS (HAProxy uses SSL passthrough)
+      - ${SSL_CERT:?SSL_CERT is required}:/etc/ssl/certs/fullchain.pem:ro
+      - ${SSL_KEY:?SSL_KEY is required}:/etc/ssl/private/privkey.pem:ro
+      # Optional: Initial pin list
+      - ${PIN_LIST:-/dev/null}:/data/pin-list.txt:ro
+    ports:
+      # IPFS Swarm - must be publicly accessible for peer connections
+      - "${PORT_SWARM:-4001}:4001/tcp"
+      - "${PORT_SWARM:-4001}:4001/udp"
+      # WSS for browser libp2p connections (TLS-terminated by nginx)
+      - "${PORT_WSS:-4003}:4003"
+      # HTTP Gateway (optional, for direct access)
+      - "${PORT_HTTP:-9080}:8080"
+      # NOTE: Ports 80/443 are NOT exposed - HAProxy handles external HTTPS traffic
+      # HAProxy connects to this container on port 443 via haproxy-net network
+    environment:
+      # IPFS configuration
+      - DOMAIN=${DOMAIN:?DOMAIN is required}
+      - DEV_MODE=${DEV_MODE:-false}
+      - IPFS_PROFILE=${IPFS_PROFILE:-server}
+      - IPFS_LOGGING=${IPFS_LOGGING:-info}
+      # Nostr pinner configuration (Unicity relays)
+      - NOSTR_RELAYS=${NOSTR_RELAYS:-wss://nostr-relay.testnet.unicity.network,ws://unicity-nostr-relay-20250927-alb-1919039002.me-central-1.elb.amazonaws.com:8080}
+      - PIN_KIND=${PIN_KIND:-30078}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RECONNECT_DELAY=${RECONNECT_DELAY:-10}
+      - PIN_TIMEOUT=${PIN_TIMEOUT:-300}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - haproxy-net
+
+volumes:
+  ipfs-data:
+    external: true
+
+networks:
+  # External network shared with HAProxy
+  haproxy-net:
+    external: true

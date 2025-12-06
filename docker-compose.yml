@@ -1,5 +1,3 @@
-version: '3.8'
-
 # IPFS Storage Service (Single Container with Nostr Pinner)
 # Usage:
 #   SSL_CERT=/path/to/fullchain.pem SSL_KEY=/path/to/privkey.pem DOMAIN=example.com docker-compose up -d

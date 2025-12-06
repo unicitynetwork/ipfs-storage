@@ -44,7 +44,8 @@ RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "10"))
 PIN_TIMEOUT = int(os.getenv("PIN_TIMEOUT", "300"))
 
 # CID validation regex (CIDv0 and CIDv1)
-CID_REGEX = re.compile(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44,}|bafy[a-z2-7]{50,})$')
+# CIDv1 prefixes: bafy (dag-pb), baga (dag-json), bafk (raw), etc.
+CID_REGEX = re.compile(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44,}|baf[a-z][a-z2-7]{50,}|bag[a-z][a-z2-7]{50,})$')
 
 # ==========================================
 # Logging Setup

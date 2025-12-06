@@ -53,6 +53,40 @@ make compose-up \
   DOMAIN=yourdomain.com
 ```
 
+### HAProxy Mode (Behind Reverse Proxy)
+
+To run behind HAProxy without exposing ports 80/443 publicly:
+
+```bash
+make haproxy-up \
+  SSL_CERT=/etc/letsencrypt/live/yourdomain.com/fullchain.pem \
+  SSL_KEY=/etc/letsencrypt/live/yourdomain.com/privkey.pem \
+  DOMAIN=yourdomain.com
+```
+
+This mode:
+- Joins the `haproxy-net` Docker network
+- Does NOT expose ports 80/443 to the host (HAProxy handles external HTTPS)
+- Container handles its own TLS (HAProxy uses SSL passthrough)
+- Container name `ipfs-kubo` must match the haproxy.cfg backend configuration
+
+**Prerequisites:**
+1. HAProxy must be running on `haproxy-net` network
+2. Create the network if it doesn't exist: `docker network create haproxy-net`
+3. HAProxy must be configured to route traffic to container `ipfs-kubo`
+
+**Verification:**
+```bash
+# Check container is on haproxy-net
+docker inspect ipfs-kubo | grep -A 5 haproxy-net
+
+# Test connectivity from HAProxy
+docker exec haproxy ping ipfs-kubo
+
+# Check HAProxy backend status
+docker logs haproxy 2>&1 | grep ipfs-kubo
+```
+
 The container includes:
 - **IPFS Kubo** - IPFS node with WebSocket transport
 - **nginx** - TLS termination proxy for WSS and HTTPS
@@ -86,13 +120,13 @@ make run \
 
 ## Port Reference
 
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 4001 | TCP/UDP | IPFS Swarm (peer connections) |
-| 4003 | TCP | WSS (TLS-terminated WebSocket for browsers) |
-| 443 | TCP | HTTPS Gateway |
-| 9080 | TCP | HTTP Gateway |
-| 5001 | - | IPFS API (internal only, not exposed) |
+| Port | Protocol | Purpose | HAProxy Mode |
+|------|----------|---------|--------------|
+| 4001 | TCP/UDP | IPFS Swarm (peer connections) | Exposed |
+| 4003 | TCP | WSS (TLS-terminated WebSocket for browsers) | Exposed |
+| 443 | TCP | HTTPS Gateway | Not exposed (HAProxy) |
+| 9080 | TCP | HTTP Gateway | Exposed |
+| 5001 | - | IPFS API (internal only, not exposed) | Internal |
 
 ## Configuration
 
@@ -172,6 +206,11 @@ make gc             # Run garbage collection
 make compose-up     # Start container via docker-compose
 make compose-down   # Stop container via docker-compose
 make compose-logs   # View logs
+
+# HAProxy Mode (behind reverse proxy)
+make haproxy-up     # Start behind HAProxy (no public 80/443)
+make haproxy-down   # Stop HAProxy mode stack
+make haproxy-logs   # View HAProxy mode logs
 
 # Cleanup
 make clean          # Remove container and volume (DESTRUCTIVE)
