@@ -16,6 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     python3 \
     python3-pip \
+    python3-dev \
+    # Build dependencies for secp256k1 Python package
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    libsecp256k1-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Install IPFS Kubo
@@ -83,6 +91,13 @@ ENV DOMAIN=localhost \
     PIN_KIND="30078" \
     LOG_LEVEL="INFO" \
     RECONNECT_DELAY="10" \
-    PIN_TIMEOUT="300"
+    PIN_TIMEOUT="300" \
+    # Propagation sidecar configuration
+    MAX_PINS_PER_SECOND="100" \
+    HTTP_PORT="9081" \
+    DB_PATH="/data/ipfs/propagation.db" \
+    NODE_NAME="ipfs-node" \
+    NOSTR_PRIVATE_KEY="" \
+    ANNOUNCE_PROBABILITY="0.000277778"
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

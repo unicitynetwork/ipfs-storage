@@ -159,6 +159,36 @@ http {
             proxy_pass_header Access-Control-Allow-Headers;
             proxy_pass_header Access-Control-Expose-Headers;
         }
+
+        # Routing put endpoint for IPNS record publishing (browser-signed records)
+        # Experimental: allows browser to publish pre-signed IPNS records via backend DHT
+        # Mirror to sidecar for IPNS record storage and republishing
+        location /api/v0/routing/put {
+            client_max_body_size 10M;
+            # Mirror request to sidecar for IPNS record capture
+            mirror /internal/ipns-intercept;
+            mirror_request_body on;
+            # Forward to kubo
+            proxy_pass http://127.0.0.1:5001;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        # Internal endpoint for IPNS record interception (sidecar)
+        location /internal/ipns-intercept {
+            internal;
+            proxy_pass http://127.0.0.1:9081/ipns-intercept;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 5s;
+            proxy_send_timeout 5s;
+        }
     }
 
     # HTTP redirect to HTTPS (optional, disabled by default)
