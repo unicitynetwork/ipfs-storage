@@ -22,6 +22,7 @@ Environment Variables:
     DB_PATH: SQLite database path (default: /data/ipfs/propagation.db)
     NODE_NAME: Node identity for announcements (default: ipfs-node)
     NOSTR_PRIVATE_KEY: Hex private key for publishing (optional)
+    ANNOUNCE_INTERVAL: Re-announcement interval in seconds (default: 0 = use probability)
     ANNOUNCE_PROBABILITY: Probability per second of re-announcement (default: 0.000277778 = 1/3600)
 """
 
@@ -69,7 +70,12 @@ HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
 DB_PATH = os.getenv("DB_PATH", "/data/ipfs/propagation.db")
 NODE_NAME = os.getenv("NODE_NAME", "ipfs-node")
 NOSTR_PRIVATE_KEY = os.getenv("NOSTR_PRIVATE_KEY", "")
-ANNOUNCE_PROBABILITY = float(os.getenv("ANNOUNCE_PROBABILITY", "0.000277778"))  # ~1/3600
+# Re-announcement interval: ANNOUNCE_INTERVAL (seconds) takes priority over ANNOUNCE_PROBABILITY
+ANNOUNCE_INTERVAL = int(os.getenv("ANNOUNCE_INTERVAL", "0"))  # seconds, 0 = use probability
+if ANNOUNCE_INTERVAL > 0:
+    ANNOUNCE_PROBABILITY = 1.0 / ANNOUNCE_INTERVAL
+else:
+    ANNOUNCE_PROBABILITY = float(os.getenv("ANNOUNCE_PROBABILITY", "0.000277778"))  # ~1/3600
 
 # CID validation regex (CIDv0 and CIDv1)
 CID_REGEX = re.compile(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z][a-z2-7]{50,}|bag[a-z][a-z2-7]{50,})$')

@@ -98,6 +98,7 @@ ENV DOMAIN=localhost \
     DB_PATH="/data/ipfs/propagation.db" \
     NODE_NAME="ipfs-node" \
     NOSTR_PRIVATE_KEY="" \
+    ANNOUNCE_INTERVAL="0" \
     ANNOUNCE_PROBABILITY="0.000277778"
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

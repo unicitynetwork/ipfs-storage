@@ -178,6 +178,9 @@ The Nostr pinner is integrated into the container and listens for pin requests o
 | `LOG_LEVEL` | INFO | Pinner log level (DEBUG, INFO, WARNING, ERROR) |
 | `RECONNECT_DELAY` | 10 | Seconds to wait before reconnecting to relay |
 | `PIN_TIMEOUT` | 300 | Pin operation timeout in seconds |
+| `ANNOUNCE_INTERVAL` | 0 | Re-announcement interval in seconds (0 = use probability, e.g., 30 for testing) |
+| `ANNOUNCE_PROBABILITY` | 0.000277778 | Probability per second (~1/3600 = once per hour avg) |
+| `NOSTR_PRIVATE_KEY` | (generated) | Hex private key for signing announcements (persists identity) |
 
 ## Make Commands
 

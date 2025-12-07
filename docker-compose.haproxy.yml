@@ -43,6 +43,14 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - RECONNECT_DELAY=${RECONNECT_DELAY:-10}
       - PIN_TIMEOUT=${PIN_TIMEOUT:-300}
+      # Propagation sidecar configuration
+      - MAX_PINS_PER_SECOND=${MAX_PINS_PER_SECOND:-100}
+      - HTTP_PORT=${HTTP_PORT:-9081}
+      - DB_PATH=${DB_PATH:-/data/ipfs/propagation.db}
+      - NODE_NAME=${NODE_NAME:-${DOMAIN}}
+      - NOSTR_PRIVATE_KEY=${NOSTR_PRIVATE_KEY:-}
+      - ANNOUNCE_INTERVAL=${ANNOUNCE_INTERVAL:-0}
+      - ANNOUNCE_PROBABILITY=${ANNOUNCE_PROBABILITY:-0.000277778}
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 30s

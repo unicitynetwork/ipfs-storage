@@ -41,6 +41,7 @@ services:
       - DB_PATH=${DB_PATH:-/data/ipfs/propagation.db}
       - NODE_NAME=${NODE_NAME:-${DOMAIN}}
       - NOSTR_PRIVATE_KEY=${NOSTR_PRIVATE_KEY:-}
+      - ANNOUNCE_INTERVAL=${ANNOUNCE_INTERVAL:-0}
       - ANNOUNCE_PROBABILITY=${ANNOUNCE_PROBABILITY:-0.000277778}
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
