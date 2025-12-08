@@ -50,6 +50,13 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayS
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.LowWater 100"
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.HighWater 400"
 
+# Add Unicity bootstrap peers
+echo "[IPFS] Adding Unicity bootstrap peers..."
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs2.dyndns.org/tcp/4001/p2p/12D3KooWLNi5NDPPHbrfJakAQqwBqymYTTwMQXQKEWuCrJNDdmfh" || true
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs2.dyndns.org/tcp/4003/wss/p2p/12D3KooWLNi5NDPPHbrfJakAQqwBqymYTTwMQXQKEWuCrJNDdmfh" || true
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4001/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4003/wss/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
+
 echo "[IPFS] Configuration complete"
 
 # Show current Swarm addresses

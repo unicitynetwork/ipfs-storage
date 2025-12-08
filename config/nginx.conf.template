@@ -180,6 +180,20 @@ http {
             proxy_pass_header Access-Control-Expose-Headers;
         }
 
+        # Routing get endpoint for IPNS record retrieval (progressive resolution)
+        # Allows browser to fetch IPNS records from multiple gateways for conflict detection
+        location /api/v0/routing/get {
+            proxy_pass http://127.0.0.1:5001;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 30s;
+            proxy_send_timeout 10s;
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
         # Internal endpoint for IPNS record interception (sidecar)
         location /internal/ipns-intercept {
             internal;
