@@ -355,17 +355,19 @@ class IpnsRecordStore:
         """Republish an IPNS record to kubo."""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
+                # Kubo routing/put expects multipart form data with 'value-file' field
+                files = {'value-file': ('record', record_bytes, 'application/octet-stream')}
                 response = await client.post(
                     f"{IPFS_API_URL}/api/v0/routing/put",
                     params={"arg": f"/ipns/{ipns_name}", "allow-offline": "true"},
-                    content=record_bytes
+                    files=files
                 )
 
                 if response.status_code == 200:
-                    logger.debug(f"Republished IPNS: {ipns_name[:16]}...")
+                    logger.info(f"Republished IPNS: {ipns_name[:16]}...")
                     return True
                 else:
-                    logger.warning(f"Failed to republish IPNS {ipns_name[:16]}...: {response.status_code}")
+                    logger.warning(f"Failed to republish IPNS {ipns_name[:16]}...: {response.status_code} - {response.text[:100]}")
                     return False
         except Exception as e:
             logger.error(f"Error republishing IPNS: {e}")
@@ -607,11 +609,34 @@ class IpnsInterceptServer:
             if not is_valid_ipns_name(ipns_name):
                 return web.Response(status=400, text="Invalid IPNS name")
 
-            # Read request body (marshalled record)
-            body = await request.read()
+            # Extract IPNS record from request body
+            # Handle multipart/form-data (sent by browsers/fetch) vs raw bytes
+            content_type = request.content_type
+            record_bytes = None
 
-            if body:
-                self.ipns_store.store_record(ipns_name, body)
+            if content_type and 'multipart/form-data' in content_type:
+                # Parse multipart form data to extract the actual record
+                try:
+                    reader = await request.multipart()
+                    async for part in reader:
+                        if part.name == 'file':
+                            record_bytes = await part.read()
+                            break
+                except Exception as e:
+                    logger.warning(f"Multipart parse failed, trying raw body: {e}")
+                    record_bytes = await request.read()
+            else:
+                # Raw binary body
+                record_bytes = await request.read()
+
+            if record_bytes:
+                # Validate it's not multipart boundary data (sanity check)
+                if record_bytes.startswith(b'------'):
+                    logger.error(f"Received multipart boundary as record data, skipping")
+                    return web.Response(status=400, text="Invalid record format")
+
+                logger.info(f"Storing IPNS record for {ipns_name[:16]}... ({len(record_bytes)} bytes)")
+                self.ipns_store.store_record(ipns_name, record_bytes)
                 return web.Response(status=200, text="OK")
             else:
                 return web.Response(status=400, text="Empty body")
