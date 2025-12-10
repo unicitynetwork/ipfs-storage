@@ -578,11 +578,12 @@ class ReannounceScheduler:
 class IpnsInterceptServer:
     """HTTP server to intercept IPNS publish requests."""
 
-    def __init__(self, ipns_store: IpnsRecordStore, db: sqlite3.Connection, metrics: Metrics, port: int = HTTP_PORT):
+    def __init__(self, ipns_store: IpnsRecordStore, db: sqlite3.Connection, metrics: Metrics, port: int = HTTP_PORT, scheduler: 'ReannounceScheduler' = None):
         self.ipns_store = ipns_store
         self.db = db
         self.metrics = metrics
         self.port = port
+        self.scheduler = scheduler
         self.app = web.Application()
         self._setup_routes()
 
@@ -591,6 +592,7 @@ class IpnsInterceptServer:
         self.app.router.add_post('/ipns-intercept', self._handle_ipns_intercept)
         self.app.router.add_get('/health', self._handle_health)
         self.app.router.add_get('/metrics', self._handle_metrics)
+        self.app.router.add_post('/reannounce', self._handle_reannounce)
 
     async def _handle_ipns_intercept(self, request: web.Request) -> web.Response:
         """Handle mirrored IPNS publish requests."""
@@ -700,6 +702,36 @@ class IpnsInterceptServer:
             )
         except Exception as e:
             logger.error(f"Metrics error: {e}")
+            return web.Response(
+                status=500,
+                content_type='application/json',
+                text=json.dumps({"status": "error", "message": str(e)})
+            )
+
+    async def _handle_reannounce(self, request: web.Request) -> web.Response:
+        """Manually trigger re-announcement of all IPNS records and CIDs."""
+        try:
+            if not self.scheduler:
+                return web.Response(
+                    status=503,
+                    content_type='application/json',
+                    text=json.dumps({"status": "error", "message": "Scheduler not available"})
+                )
+
+            logger.info("Manual re-announcement triggered via HTTP")
+            await self.scheduler._do_reannouncement()
+
+            return web.Response(
+                status=200,
+                content_type='application/json',
+                text=json.dumps({
+                    "status": "ok",
+                    "message": "Re-announcement triggered",
+                    "reannouncements": self.metrics.reannouncements
+                })
+            )
+        except Exception as e:
+            logger.error(f"Manual reannounce error: {e}")
             return web.Response(
                 status=500,
                 content_type='application/json',
@@ -914,7 +946,7 @@ async def main():
     ipns_store = IpnsRecordStore(db, metrics)
     publisher = NostrPublisher(NOSTR_RELAYS, NOSTR_PRIVATE_KEY)
     scheduler = ReannounceScheduler(db, ipns_store, publisher, metrics)
-    http_server = IpnsInterceptServer(ipns_store, db, metrics, HTTP_PORT)
+    http_server = IpnsInterceptServer(ipns_store, db, metrics, HTTP_PORT, scheduler=scheduler)
 
     shutdown_event = asyncio.Event()
 
