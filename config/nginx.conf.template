@@ -237,6 +237,17 @@ http {
         # Routing get endpoint for IPNS record retrieval
         # FAST PATH: Try sidecar database first (5-20ms), fallback to kubo DHT (1-5s)
         location /api/v0/routing/get {
+            # Handle CORS preflight
+            if ($request_method = 'OPTIONS') {
+                add_header Access-Control-Allow-Origin * always;
+                add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+                add_header Access-Control-Allow-Headers "Content-Type, Accept" always;
+                add_header Access-Control-Max-Age 86400;
+                add_header Content-Length 0;
+                add_header Content-Type text/plain;
+                return 204;
+            }
+
             # Try sidecar first (instant DB lookup)
             proxy_pass http://sidecar/routing-get$is_args$args;
             proxy_connect_timeout 1s;
@@ -248,11 +259,11 @@ http {
             proxy_intercept_errors on;
             error_page 404 500 502 504 = @routing_get_fallback;
 
-            # Pass through CORS headers from sidecar
-            proxy_pass_header Access-Control-Allow-Origin;
-            proxy_pass_header Access-Control-Allow-Methods;
-            proxy_pass_header Access-Control-Allow-Headers;
-            proxy_pass_header Access-Control-Expose-Headers;
+            # Add CORS headers to all responses (sidecar doesn't add them)
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, Accept" always;
+            add_header Access-Control-Expose-Headers "X-IPNS-Source, X-IPNS-Last-Updated" always;
         }
 
         # Fallback to kubo DHT resolution when sidecar returns 404
@@ -262,10 +273,12 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_read_timeout 30s;
             proxy_send_timeout 10s;
-            proxy_pass_header Access-Control-Allow-Origin;
-            proxy_pass_header Access-Control-Allow-Methods;
-            proxy_pass_header Access-Control-Allow-Headers;
-            proxy_pass_header Access-Control-Expose-Headers;
+
+            # Add CORS headers (kubo may or may not add them)
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, Accept" always;
+            add_header Access-Control-Expose-Headers "X-IPNS-Source" always;
         }
 
         # Pin status check endpoint (fast local lookup)
