@@ -593,6 +593,10 @@ class IpnsInterceptServer:
         self.app.router.add_get('/health', self._handle_health)
         self.app.router.add_get('/metrics', self._handle_metrics)
         self.app.router.add_post('/reannounce', self._handle_reannounce)
+        # Fast-path serving endpoints
+        self.app.router.add_get('/routing-get', self._handle_routing_get)
+        self.app.router.add_post('/routing-get', self._handle_routing_get)  # Support POST like kubo
+        self.app.router.add_get('/pin-status', self._handle_pin_status)
 
     async def _handle_ipns_intercept(self, request: web.Request) -> web.Response:
         """Handle mirrored IPNS publish requests."""
@@ -736,6 +740,124 @@ class IpnsInterceptServer:
                 status=500,
                 content_type='application/json',
                 text=json.dumps({"status": "error", "message": str(e)})
+            )
+
+    async def _handle_routing_get(self, request: web.Request) -> web.Response:
+        """
+        Fast-path IPNS record serving from database.
+        Returns 404 if not found (nginx will fallback to kubo).
+        Matches kubo API format: {"Extra": "<base64-encoded-record>", "Type": 5}
+        """
+        try:
+            # Extract IPNS name from query param: ?arg=/ipns/{name}
+            arg = request.query.get('arg', '')
+            match = re.match(r'^/ipns/(.+)$', arg)
+            if not match:
+                logger.debug(f"routing-get: Invalid arg format: {arg}")
+                return web.Response(status=400, text='Invalid arg format')
+
+            ipns_name = match.group(1)
+
+            if not is_valid_ipns_name(ipns_name):
+                logger.debug(f"routing-get: Invalid IPNS name: {ipns_name}")
+                return web.Response(status=400, text='Invalid IPNS name')
+
+            # Query database for stored record
+            cursor = self.db.cursor()
+            cursor.execute(
+                'SELECT marshalled_record, cid, last_updated FROM ipns_records WHERE ipns_name = ?',
+                (ipns_name,)
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                # Not in database - return 404 to trigger nginx fallback to kubo
+                logger.debug(f"routing-get: IPNS {ipns_name[:16]}... not in database")
+                return web.Response(status=404, text='Not found')
+
+            marshalled_record = row['marshalled_record']
+            cid = row['cid']
+            last_updated = row['last_updated']
+
+            logger.info(f"routing-get: Fast-serving IPNS {ipns_name[:16]}... -> {cid[:16] if cid else 'unknown'}...")
+
+            # Return in kubo-compatible format (base64-encoded record in Extra field)
+            response_data = {
+                "Extra": base64.b64encode(marshalled_record).decode('ascii'),
+                "Type": 5  # IPNS record type (matches kubo's response)
+            }
+
+            return web.Response(
+                status=200,
+                content_type='application/json',
+                text=json.dumps(response_data),
+                headers={
+                    'X-IPNS-Source': 'sidecar-cache',
+                    'X-IPNS-Last-Updated': str(last_updated) if last_updated else ''
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"routing-get error: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def _handle_pin_status(self, request: web.Request) -> web.Response:
+        """
+        Check if a CID is pinned locally.
+        Used for instant verification without IPFS API call.
+        """
+        try:
+            cid = request.query.get('cid', '')
+
+            if not cid:
+                return web.Response(
+                    status=400,
+                    content_type='application/json',
+                    text=json.dumps({"error": "Missing cid parameter"})
+                )
+
+            if not is_valid_cid(cid):
+                return web.Response(
+                    status=400,
+                    content_type='application/json',
+                    text=json.dumps({"error": "Invalid CID format"})
+                )
+
+            # Query database
+            cursor = self.db.cursor()
+            cursor.execute(
+                'SELECT pinned_at, source FROM pinned_cids WHERE cid = ?',
+                (cid,)
+            )
+            row = cursor.fetchone()
+
+            if row:
+                return web.Response(
+                    status=200,
+                    content_type='application/json',
+                    text=json.dumps({
+                        "pinned": True,
+                        "cid": cid,
+                        "pinned_at": row['pinned_at'],
+                        "source": row['source']
+                    })
+                )
+            else:
+                return web.Response(
+                    status=200,
+                    content_type='application/json',
+                    text=json.dumps({
+                        "pinned": False,
+                        "cid": cid
+                    })
+                )
+
+        except Exception as e:
+            logger.error(f"pin-status error: {e}")
+            return web.Response(
+                status=500,
+                content_type='application/json',
+                text=json.dumps({"error": str(e)})
             )
 
     async def start(self):

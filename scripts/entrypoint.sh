@@ -87,6 +87,10 @@ init_ipfs() {
 configure_nginx() {
     echo "[INFO] Rendering nginx configuration..."
 
+    # Ensure cache directory exists at runtime (handles volume mounts)
+    mkdir -p /var/cache/nginx/ipfs
+    chown -R www-data:www-data /var/cache/nginx
+
     # Use envsubst to render template
     envsubst '${DOMAIN} ${SSL_CERT_PATH} ${SSL_KEY_PATH}' \
         < /etc/nginx/nginx.conf.template \

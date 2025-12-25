@@ -57,6 +57,23 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicit
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4001/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4003/wss/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
 
+# === PERFORMANCE OPTIMIZATIONS FOR FAST HTTP RESPONSES ===
+echo "[IPFS] Applying performance optimizations..."
+
+# Enable Accelerated DHT Client (critical for fast IPNS lookups)
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Routing.AcceleratedDHTClient true"
+
+# Increase IPNS cache size for faster repeated lookups
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Ipns.ResolveCacheSize 4096"
+
+# Enable gateway routing API exposure
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Gateway.ExposeRoutingAPI true"
+
+# Optimize datastore bloom filter for faster reads
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Datastore.BloomFilterSize 1048576"
+
+echo "[IPFS] Performance optimizations applied"
+
 echo "[IPFS] Configuration complete"
 
 # Show current Swarm addresses

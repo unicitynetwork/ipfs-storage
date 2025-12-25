@@ -43,8 +43,8 @@ RUN useradd -m -d /data/ipfs -u 1000 -s /bin/bash ipfs && \
     chown -R ipfs:ipfs /data/ipfs
 
 # Create nginx directories
-RUN mkdir -p /run/nginx /var/log/nginx && \
-    chown -R www-data:www-data /run/nginx /var/log/nginx
+RUN mkdir -p /run/nginx /var/log/nginx /var/cache/nginx/ipfs && \
+    chown -R www-data:www-data /run/nginx /var/log/nginx /var/cache/nginx
 
 # Install nostr-pinner Python dependencies
 COPY nostr-pinner/requirements.txt /tmp/nostr-requirements.txt

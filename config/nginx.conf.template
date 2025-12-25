@@ -63,9 +63,18 @@ http {
     gzip_comp_level 6;
     gzip_types text/plain text/css text/xml application/json application/javascript application/xml;
 
+    # === IPFS CONTENT CACHING ===
+    # Cache for CID-addressed content (immutable) and IPNS lookups
+    proxy_cache_path /var/cache/nginx/ipfs levels=1:2 keys_zone=ipfs_cache:100m max_size=10g inactive=7d use_temp_path=off;
+
     # Upstream to IPFS Gateway
     upstream ipfs_gateway {
         server 127.0.0.1:8080;
+    }
+
+    # Upstream to sidecar service (for fast-path IPNS/pin lookups)
+    upstream sidecar {
+        server 127.0.0.1:9081;
     }
 
     # HTTPS Gateway server
@@ -85,6 +94,51 @@ http {
         add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header X-XSS-Protection "1; mode=block" always;
+
+        # Cached /ipfs/ content (CID-addressed = immutable, safe to cache long-term)
+        location /ipfs/ {
+            proxy_pass http://ipfs_gateway;
+            proxy_cache ipfs_cache;
+            proxy_cache_valid 200 7d;
+            proxy_cache_key $uri;
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+            proxy_cache_background_update on;
+            proxy_cache_lock on;
+            add_header X-Cache-Status $upstream_cache_status;
+
+            # Prevent cache poisoning
+            proxy_set_header Accept-Encoding "";
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 30s;
+        }
+
+        # Cached /ipns/ content (mutable, short cache for fast repeated lookups)
+        location /ipns/ {
+            proxy_pass http://ipfs_gateway;
+            proxy_cache ipfs_cache;
+            proxy_cache_valid 200 30s;
+            proxy_cache_key $uri;  # Ignore query params for stable caching
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+            proxy_cache_background_update on;
+            proxy_cache_lock on;
+            add_header X-Cache-Status $upstream_cache_status;
+
+            # Allow cache bypass for critical reads
+            proxy_cache_bypass $http_x_no_cache;
+
+            # Prevent cache poisoning
+            proxy_set_header Accept-Encoding "";
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 10s;
+        }
 
         # IPFS Gateway proxy
         location / {
@@ -180,10 +234,30 @@ http {
             proxy_pass_header Access-Control-Expose-Headers;
         }
 
-        # Routing get endpoint for IPNS record retrieval (progressive resolution)
-        # Allows browser to fetch IPNS records from multiple gateways for conflict detection
+        # Routing get endpoint for IPNS record retrieval
+        # FAST PATH: Try sidecar database first (5-20ms), fallback to kubo DHT (1-5s)
         location /api/v0/routing/get {
-            proxy_pass http://127.0.0.1:5001;
+            # Try sidecar first (instant DB lookup)
+            proxy_pass http://sidecar/routing-get$is_args$args;
+            proxy_connect_timeout 1s;
+            proxy_read_timeout 2s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+
+            # On 404 (not in cache) or error, fall back to kubo
+            proxy_intercept_errors on;
+            error_page 404 500 502 504 = @routing_get_fallback;
+
+            # Pass through CORS headers from sidecar
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        # Fallback to kubo DHT resolution when sidecar returns 404
+        location @routing_get_fallback {
+            proxy_pass http://127.0.0.1:5001/api/v0/routing/get$is_args$args;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_read_timeout 30s;
@@ -192,6 +266,19 @@ http {
             proxy_pass_header Access-Control-Allow-Methods;
             proxy_pass_header Access-Control-Allow-Headers;
             proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        # Pin status check endpoint (fast local lookup)
+        location /pin-status {
+            proxy_pass http://sidecar/pin-status$is_args$args;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 5s;
+
+            # Add CORS headers for browser access
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type" always;
         }
 
         # Internal endpoint for IPNS record interception (sidecar)
