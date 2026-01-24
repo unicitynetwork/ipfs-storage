@@ -97,6 +97,11 @@ http {
 
         # Cached /ipfs/ content (CID-addressed = immutable, safe to cache long-term)
         location /ipfs/ {
+            # CRITICAL: Disable gzip compression for content-addressed data
+            # Gzipping JSON and then re-serializing breaks CID verification
+            # (JSON.stringify may reorder keys -> different bytes -> different hash)
+            gzip off;
+
             proxy_pass http://ipfs_gateway;
             proxy_cache ipfs_cache;
             proxy_cache_valid 200 7d;
@@ -106,7 +111,7 @@ http {
             proxy_cache_lock on;
             add_header X-Cache-Status $upstream_cache_status;
 
-            # Prevent cache poisoning
+            # Prevent cache poisoning (keep for defense in depth)
             proxy_set_header Accept-Encoding "";
 
             proxy_set_header Host $host;
@@ -118,6 +123,10 @@ http {
 
         # Cached /ipns/ content (mutable, short cache for fast repeated lookups)
         location /ipns/ {
+            # CRITICAL: Disable gzip compression for IPNS resolution content
+            # IPNS resolves to immutable CID, which requires byte-exact verification
+            gzip off;
+
             proxy_pass http://ipfs_gateway;
             proxy_cache ipfs_cache;
             proxy_cache_valid 200 30s;
@@ -130,7 +139,7 @@ http {
             # Allow cache bypass for critical reads
             proxy_cache_bypass $http_x_no_cache;
 
-            # Prevent cache poisoning
+            # Prevent cache poisoning (keep for defense in depth)
             proxy_set_header Accept-Encoding "";
 
             proxy_set_header Host $host;
@@ -288,6 +297,21 @@ http {
             add_header Access-Control-Allow-Origin * always;
             add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
             add_header Access-Control-Allow-Headers "Content-Type" always;
+        }
+
+        # WebSocket endpoint for IPNS subscription updates
+        # Clients subscribe to IPNS names and receive push notifications on updates
+        location /ws/ipns {
+            proxy_pass http://sidecar/ws/ipns;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 86400;  # 24h for long-lived connections
+
+            # Add CORS headers for browser WebSocket connections
+            add_header Access-Control-Allow-Origin * always;
         }
 
         # Internal endpoint for IPNS record interception (sidecar)

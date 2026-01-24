@@ -77,6 +77,9 @@ if ANNOUNCE_INTERVAL > 0:
 else:
     ANNOUNCE_PROBABILITY = float(os.getenv("ANNOUNCE_PROBABILITY", "0.000277778"))  # ~1/3600
 
+# Staleness threshold for IPNS records - records older than this trigger async DHT sync
+STALE_THRESHOLD_SECONDS = int(os.getenv("STALE_THRESHOLD_SECONDS", "60"))
+
 # CID validation regex (CIDv0 and CIDv1)
 CID_REGEX = re.compile(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z][a-z2-7]{50,}|bag[a-z][a-z2-7]{50,})$')
 
@@ -152,11 +155,19 @@ def init_database(db_path: str) -> sqlite3.Connection:
             ipns_name TEXT PRIMARY KEY,
             marshalled_record BLOB NOT NULL,
             cid TEXT,
+            sequence INTEGER DEFAULT 0,
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_announced TIMESTAMP,
             announce_count INTEGER DEFAULT 0
         )
     """)
+
+    # Migration: Add sequence column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute("ALTER TABLE ipns_records ADD COLUMN sequence INTEGER DEFAULT 0")
+        logger.info("Added sequence column to ipns_records table")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS metrics (
@@ -187,6 +198,82 @@ def is_valid_ipns_name(name: str) -> bool:
     if not name:
         return False
     return bool(IPNS_REGEX.match(name))
+
+
+def parse_ipns_record(record_bytes: bytes) -> tuple[int, str | None]:
+    """
+    Parse IPNS record (protobuf) to extract sequence number and CID.
+
+    IPNS record protobuf fields (from ipns.proto):
+    - field 1 (bytes): value (path like /ipfs/<cid>)
+    - field 3 (varint): validity_type (EOL=0)
+    - field 5 (varint): sequence number  <- IMPORTANT: field 5, not 3!
+    - field 6 (varint): ttl
+
+    Returns: (sequence_number, cid_or_none)
+    """
+    sequence = 0
+    value = None
+
+    try:
+        pos = 0
+        while pos < len(record_bytes):
+            # Read field key (varint)
+            key = 0
+            shift = 0
+            while pos < len(record_bytes):
+                b = record_bytes[pos]
+                pos += 1
+                key |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    break
+                shift += 7
+
+            field_number = key >> 3
+            wire_type = key & 0x07
+
+            if wire_type == 0:  # Varint
+                val = 0
+                shift = 0
+                while pos < len(record_bytes):
+                    b = record_bytes[pos]
+                    pos += 1
+                    val |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+
+                if field_number == 5:  # sequence (field 5, not 3!)
+                    sequence = val
+
+            elif wire_type == 2:  # Length-delimited
+                length = 0
+                shift = 0
+                while pos < len(record_bytes):
+                    b = record_bytes[pos]
+                    pos += 1
+                    length |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+
+                data = record_bytes[pos:pos + length]
+                pos += length
+
+                if field_number == 1:  # value
+                    value = data.decode('utf-8', errors='ignore')
+            else:
+                # Skip unknown wire types
+                break
+    except Exception as e:
+        logger.warning(f"Error parsing IPNS record: {e}")
+
+    # Extract CID from value (e.g., "/ipfs/bafyrei...")
+    cid = None
+    if value and value.startswith('/ipfs/'):
+        cid = value[6:]  # Remove /ipfs/ prefix
+
+    return (sequence, cid)
 
 
 # ==========================================
@@ -329,21 +416,50 @@ class IpnsRecordStore:
         self.db = db
         self.metrics = metrics
 
-    def store_record(self, ipns_name: str, record_bytes: bytes, cid: Optional[str] = None):
-        """Store an IPNS record for later republishing."""
+    def store_record(self, ipns_name: str, record_bytes: bytes, cid: Optional[str] = None) -> bool:
+        """
+        Store an IPNS record for later republishing.
+        Only stores if the new record has a sequence >= existing sequence.
+
+        Returns True if stored, False if rejected due to lower sequence.
+        """
         try:
+            # Parse the incoming record to get sequence and CID
+            new_sequence, parsed_cid = parse_ipns_record(record_bytes)
+            if cid is None and parsed_cid:
+                cid = parsed_cid
+
             cursor = self.db.cursor()
+
+            # Check existing sequence
+            cursor.execute(
+                'SELECT sequence FROM ipns_records WHERE ipns_name = ?',
+                (ipns_name,)
+            )
+            row = cursor.fetchone()
+            existing_sequence = row['sequence'] if row else 0
+
+            # Only store if new sequence is >= existing (allows same seq for updates)
+            if new_sequence < existing_sequence:
+                logger.warning(
+                    f"Rejecting IPNS record for {ipns_name[:16]}...: "
+                    f"new seq={new_sequence} < existing seq={existing_sequence}"
+                )
+                return False
+
             cursor.execute(
                 """INSERT OR REPLACE INTO ipns_records
-                   (ipns_name, marshalled_record, cid, last_updated)
-                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)""",
-                (ipns_name, record_bytes, cid)
+                   (ipns_name, marshalled_record, cid, sequence, last_updated)
+                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (ipns_name, record_bytes, cid, new_sequence)
             )
             self.db.commit()
             self.metrics.ipns_records_stored += 1
-            logger.info(f"Stored IPNS record: {ipns_name[:16]}...")
+            logger.info(f"Stored IPNS record: {ipns_name[:16]}... seq={new_sequence}")
+            return True
         except Exception as e:
             logger.error(f"Error storing IPNS record: {e}")
+            return False
 
     def get_all_records(self) -> list[tuple[str, bytes]]:
         """Get all stored IPNS records."""
@@ -352,14 +468,15 @@ class IpnsRecordStore:
         return [(row['ipns_name'], row['marshalled_record']) for row in cursor.fetchall()]
 
     async def republish_record(self, ipns_name: str, record_bytes: bytes) -> bool:
-        """Republish an IPNS record to kubo."""
+        """Republish an IPNS record to kubo DHT."""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 # Kubo routing/put expects multipart form data with 'value-file' field
+                # NOTE: Removed allow-offline=true which was preventing DHT propagation!
                 files = {'value-file': ('record', record_bytes, 'application/octet-stream')}
                 response = await client.post(
                     f"{IPFS_API_URL}/api/v0/routing/put",
-                    params={"arg": f"/ipns/{ipns_name}", "allow-offline": "true"},
+                    params={"arg": f"/ipns/{ipns_name}"},
                     files=files
                 )
 
@@ -387,6 +504,230 @@ class IpnsRecordStore:
             self.db.commit()
         except Exception as e:
             logger.error(f"Error marking IPNS announced: {e}")
+
+
+# ==========================================
+# DHT Sync Worker (Background)
+# ==========================================
+
+class DhtSyncWorker:
+    """
+    Background worker that syncs SQLite with Kubo DHT.
+    Triggered when cached records become stale.
+    """
+
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        ipns_store: IpnsRecordStore,
+        subscription_manager: 'IpnsSubscriptionManager'
+    ):
+        self.db = db
+        self.ipns_store = ipns_store
+        self.subscription_manager = subscription_manager
+        self.sync_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
+        self.in_flight: set[str] = set()  # Deduplicate concurrent syncs
+
+    async def run(self, shutdown_event: asyncio.Event):
+        """Main sync loop - processes queue of stale IPNS names."""
+        logger.info("DHT sync worker started")
+
+        while not shutdown_event.is_set():
+            try:
+                # Wait for next IPNS name to sync (with timeout)
+                try:
+                    ipns_name = await asyncio.wait_for(
+                        self.sync_queue.get(),
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if ipns_name in self.in_flight:
+                    continue  # Already syncing
+
+                self.in_flight.add(ipns_name)
+                try:
+                    await self._sync_single_record(ipns_name)
+                finally:
+                    self.in_flight.discard(ipns_name)
+
+            except Exception as e:
+                logger.error(f"DHT sync worker error: {e}")
+                await asyncio.sleep(1)
+
+        logger.info("DHT sync worker stopped")
+
+    async def sync_record(self, ipns_name: str):
+        """Queue an IPNS name for background sync."""
+        if ipns_name not in self.in_flight:
+            try:
+                self.sync_queue.put_nowait(ipns_name)
+            except asyncio.QueueFull:
+                logger.warning(f"Sync queue full, dropping {ipns_name[:16]}...")
+
+    async def _sync_single_record(self, ipns_name: str):
+        """Fetch latest record from DHT and update SQLite if newer."""
+        try:
+            # Get current sequence from SQLite
+            cursor = self.db.cursor()
+            cursor.execute(
+                'SELECT sequence FROM ipns_records WHERE ipns_name = ?',
+                (ipns_name,)
+            )
+            row = cursor.fetchone()
+            db_sequence = row['sequence'] if row else 0
+
+            # Query Kubo DHT
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    f"{IPFS_API_URL}/api/v0/routing/get",
+                    params={"arg": f"/ipns/{ipns_name}"}
+                )
+
+                if response.status_code != 200:
+                    return
+
+                kubo_data = response.json()
+                if not kubo_data.get('Extra'):
+                    return
+
+                record_bytes = base64.b64decode(kubo_data['Extra'])
+                kubo_sequence, cid = parse_ipns_record(record_bytes)
+
+                # Only update if DHT has newer record
+                if kubo_sequence > db_sequence:
+                    logger.info(
+                        f"DHT sync: updating {ipns_name[:16]}... "
+                        f"seq {db_sequence} -> {kubo_sequence}"
+                    )
+                    self.ipns_store.store_record(ipns_name, record_bytes)
+
+                    # Notify WebSocket subscribers of update
+                    await self.subscription_manager.notify(
+                        ipns_name, kubo_sequence, cid
+                    )
+                else:
+                    # Just update last_updated timestamp
+                    cursor.execute(
+                        'UPDATE ipns_records SET last_updated = ? WHERE ipns_name = ?',
+                        (datetime.utcnow().isoformat(), ipns_name)
+                    )
+                    self.db.commit()
+
+        except Exception as e:
+            logger.debug(f"DHT sync failed for {ipns_name[:16]}...: {e}")
+
+
+# ==========================================
+# WebSocket Subscription Manager
+# ==========================================
+
+class IpnsSubscriptionManager:
+    """
+    WebSocket subscription manager for IPNS updates.
+    Clients subscribe to specific IPNS names and receive push notifications.
+    """
+
+    def __init__(self):
+        # Map: ipns_name -> set of WebSocket connections
+        self.subscriptions: dict[str, set[web.WebSocketResponse]] = {}
+        self.lock = asyncio.Lock()
+
+    async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        """Handle WebSocket connection for /ws/ipns."""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        logger.info(f"New WebSocket connection from {request.remote}")
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    await self._handle_message(ws, msg.data)
+                elif msg.type == web.WSMsgType.ERROR:
+                    logger.error(f"WebSocket error: {ws.exception()}")
+                    break
+        finally:
+            await self._remove_all_subscriptions(ws)
+
+        return ws
+
+    async def _handle_message(self, ws: web.WebSocketResponse, data: str):
+        """Handle incoming WebSocket message."""
+        try:
+            message = json.loads(data)
+            action = message.get('action')
+
+            if action == 'subscribe':
+                ipns_names = message.get('names', [])
+                for name in ipns_names:
+                    if is_valid_ipns_name(name):
+                        await self._add_subscription(name, ws)
+                await ws.send_json({
+                    'type': 'subscribed',
+                    'names': ipns_names
+                })
+
+            elif action == 'unsubscribe':
+                ipns_names = message.get('names', [])
+                for name in ipns_names:
+                    await self._remove_subscription(name, ws)
+                await ws.send_json({
+                    'type': 'unsubscribed',
+                    'names': ipns_names
+                })
+
+            elif action == 'ping':
+                await ws.send_json({'type': 'pong'})
+
+        except json.JSONDecodeError:
+            await ws.send_json({'type': 'error', 'message': 'Invalid JSON'})
+        except Exception as e:
+            logger.error(f"WebSocket message error: {e}")
+
+    async def _add_subscription(self, ipns_name: str, ws: web.WebSocketResponse):
+        async with self.lock:
+            if ipns_name not in self.subscriptions:
+                self.subscriptions[ipns_name] = set()
+            self.subscriptions[ipns_name].add(ws)
+
+    async def _remove_subscription(self, ipns_name: str, ws: web.WebSocketResponse):
+        async with self.lock:
+            if ipns_name in self.subscriptions:
+                self.subscriptions[ipns_name].discard(ws)
+                if not self.subscriptions[ipns_name]:
+                    del self.subscriptions[ipns_name]
+
+    async def _remove_all_subscriptions(self, ws: web.WebSocketResponse):
+        async with self.lock:
+            for name in list(self.subscriptions.keys()):
+                self.subscriptions[name].discard(ws)
+                if not self.subscriptions[name]:
+                    del self.subscriptions[name]
+
+    async def notify(self, ipns_name: str, sequence: int, cid: str | None):
+        """Notify all subscribers of an IPNS update."""
+        async with self.lock:
+            subscribers = self.subscriptions.get(ipns_name, set()).copy()
+
+        if not subscribers:
+            return
+
+        message = json.dumps({
+            'type': 'update',
+            'name': ipns_name,
+            'sequence': sequence,
+            'cid': cid,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+
+        for ws in subscribers:
+            try:
+                if not ws.closed:
+                    await ws.send_str(message)
+            except Exception as e:
+                logger.debug(f"Failed to notify subscriber: {e}")
 
 
 # ==========================================
@@ -585,6 +926,15 @@ class IpnsInterceptServer:
         self.port = port
         self.scheduler = scheduler
         self.app = web.Application()
+
+        # Initialize subscription manager for WebSocket IPNS updates
+        self.subscription_manager = IpnsSubscriptionManager()
+
+        # Initialize DHT sync worker for background synchronization
+        self.dht_sync_worker = DhtSyncWorker(
+            db, ipns_store, self.subscription_manager
+        )
+
         self._setup_routes()
 
     def _setup_routes(self):
@@ -597,6 +947,8 @@ class IpnsInterceptServer:
         self.app.router.add_get('/routing-get', self._handle_routing_get)
         self.app.router.add_post('/routing-get', self._handle_routing_get)  # Support POST like kubo
         self.app.router.add_get('/pin-status', self._handle_pin_status)
+        # WebSocket endpoint for IPNS subscriptions
+        self.app.router.add_get('/ws/ipns', self.subscription_manager.handle_websocket)
 
     async def _handle_ipns_intercept(self, request: web.Request) -> web.Response:
         """Handle mirrored IPNS publish requests."""
@@ -742,11 +1094,72 @@ class IpnsInterceptServer:
                 text=json.dumps({"status": "error", "message": str(e)})
             )
 
+    def _is_stale(self, last_updated: str | None) -> bool:
+        """Check if record is older than STALE_THRESHOLD_SECONDS."""
+        if not last_updated:
+            return True
+        try:
+            # Handle both ISO format with and without timezone
+            if last_updated.endswith('Z'):
+                updated_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+            elif '+' in last_updated or last_updated.endswith('+00:00'):
+                updated_time = datetime.fromisoformat(last_updated)
+            else:
+                # Assume UTC if no timezone
+                updated_time = datetime.fromisoformat(last_updated)
+                updated_time = updated_time.replace(tzinfo=None)
+                age = (datetime.utcnow() - updated_time).total_seconds()
+                return age > STALE_THRESHOLD_SECONDS
+
+            age = (datetime.now(updated_time.tzinfo) - updated_time).total_seconds()
+            return age > STALE_THRESHOLD_SECONDS
+        except Exception:
+            return True
+
+    async def _fetch_from_dht_and_store(self, ipns_name: str) -> web.Response:
+        """Blocking DHT fetch for records not in cache."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    f"{IPFS_API_URL}/api/v0/routing/get",
+                    params={"arg": f"/ipns/{ipns_name}"}
+                )
+                if response.status_code == 200:
+                    kubo_data = response.json()
+                    if kubo_data.get('Extra'):
+                        record_bytes = base64.b64decode(kubo_data['Extra'])
+                        sequence, cid = parse_ipns_record(record_bytes)
+
+                        # Store in SQLite for future fast lookups
+                        self.ipns_store.store_record(ipns_name, record_bytes)
+
+                        # Notify WebSocket subscribers
+                        await self.subscription_manager.notify(ipns_name, sequence, cid)
+
+                        return web.Response(
+                            status=200,
+                            content_type='application/json',
+                            text=json.dumps(kubo_data),
+                            headers={
+                                'X-IPNS-Source': 'kubo',
+                                'X-IPNS-Sequence': str(sequence)
+                            }
+                        )
+            return web.Response(status=404, text='Not found')
+        except Exception as e:
+            logger.error(f"DHT fetch error for {ipns_name[:16]}...: {e}")
+            return web.Response(status=500, text=str(e))
+
     async def _handle_routing_get(self, request: web.Request) -> web.Response:
         """
-        Fast-path IPNS record serving from database.
-        Returns 404 if not found (nginx will fallback to kubo).
-        Matches kubo API format: {"Extra": "<base64-encoded-record>", "Type": 5}
+        Fast-path IPNS resolution: SQLite-first, async DHT sync.
+        Target latency: 5-20ms for cached records.
+
+        Flow:
+        1. Query SQLite immediately (5-20ms)
+        2. If record exists, return it immediately
+        3. If record is stale, trigger async DHT sync (non-blocking)
+        4. If no record exists, blocking DHT fetch (first request only)
         """
         try:
             # Extract IPNS name from query param: ?arg=/ipns/{name}
@@ -762,40 +1175,44 @@ class IpnsInterceptServer:
                 logger.debug(f"routing-get: Invalid IPNS name: {ipns_name}")
                 return web.Response(status=400, text='Invalid IPNS name')
 
-            # Query database for stored record
+            # 1. Query SQLite immediately (5-20ms)
             cursor = self.db.cursor()
             cursor.execute(
-                'SELECT marshalled_record, cid, last_updated FROM ipns_records WHERE ipns_name = ?',
+                'SELECT marshalled_record, cid, sequence, last_updated FROM ipns_records WHERE ipns_name = ?',
                 (ipns_name,)
             )
             row = cursor.fetchone()
 
-            if not row:
-                # Not in database - return 404 to trigger nginx fallback to kubo
-                logger.debug(f"routing-get: IPNS {ipns_name[:16]}... not in database")
-                return web.Response(status=404, text='Not found')
+            if row:
+                db_record = row['marshalled_record']
+                db_sequence = row['sequence'] or 0
+                last_updated = row['last_updated']
 
-            marshalled_record = row['marshalled_record']
-            cid = row['cid']
-            last_updated = row['last_updated']
+                # Check staleness and trigger async DHT sync if needed
+                if self._is_stale(last_updated):
+                    # Non-blocking: queue DHT sync task
+                    asyncio.create_task(self.dht_sync_worker.sync_record(ipns_name))
+                    logger.debug(f"routing-get: Queued async DHT sync for stale record {ipns_name[:16]}...")
 
-            logger.info(f"routing-get: Fast-serving IPNS {ipns_name[:16]}... -> {cid[:16] if cid else 'unknown'}...")
-
-            # Return in kubo-compatible format (base64-encoded record in Extra field)
-            response_data = {
-                "Extra": base64.b64encode(marshalled_record).decode('ascii'),
-                "Type": 5  # IPNS record type (matches kubo's response)
-            }
-
-            return web.Response(
-                status=200,
-                content_type='application/json',
-                text=json.dumps(response_data),
-                headers={
-                    'X-IPNS-Source': 'sidecar-cache',
-                    'X-IPNS-Last-Updated': str(last_updated) if last_updated else ''
+                # Return immediately from SQLite
+                response_data = {
+                    "Extra": base64.b64encode(db_record).decode('ascii'),
+                    "Type": 5
                 }
-            )
+                return web.Response(
+                    status=200,
+                    content_type='application/json',
+                    text=json.dumps(response_data),
+                    headers={
+                        'X-IPNS-Source': 'sidecar-cache',
+                        'X-IPNS-Sequence': str(db_sequence),
+                        'X-IPNS-Last-Updated': last_updated or ''
+                    }
+                )
+            else:
+                # No record in SQLite - must query DHT (blocking for first fetch)
+                logger.info(f"routing-get: No cache for {ipns_name[:16]}..., fetching from DHT")
+                return await self._fetch_from_dht_and_store(ipns_name)
 
         except Exception as e:
             logger.error(f"routing-get error: {e}")
@@ -1052,6 +1469,7 @@ async def main():
     logger.info(f"  HTTP port:      {HTTP_PORT}")
     logger.info(f"  Database:       {DB_PATH}")
     logger.info(f"  Node name:      {NODE_NAME}")
+    logger.info(f"  Stale threshold: {STALE_THRESHOLD_SECONDS}s")
     logger.info("=" * 60)
 
     # Wait for IPFS to be available
@@ -1106,7 +1524,13 @@ async def main():
         name="scheduler"
     )
 
-    logger.info(f"Service started: {len(relay_tasks)} relay(s), rate-limited queue, scheduler")
+    # Start DHT sync worker for background IPNS record synchronization
+    dht_sync_task = asyncio.create_task(
+        http_server.dht_sync_worker.run(shutdown_event),
+        name="dht-sync"
+    )
+
+    logger.info(f"Service started: {len(relay_tasks)} relay(s), rate-limited queue, scheduler, DHT sync worker")
 
     # Wait for shutdown
     await shutdown_event.wait()
@@ -1115,10 +1539,10 @@ async def main():
     logger.info("Shutting down...")
 
     # Cancel all tasks
-    for task in relay_tasks + [queue_task, scheduler_task]:
+    for task in relay_tasks + [queue_task, scheduler_task, dht_sync_task]:
         task.cancel()
 
-    await asyncio.gather(*relay_tasks, queue_task, scheduler_task, return_exceptions=True)
+    await asyncio.gather(*relay_tasks, queue_task, scheduler_task, dht_sync_task, return_exceptions=True)
 
     # Cleanup HTTP server
     await http_runner.cleanup()
