@@ -9,6 +9,7 @@ Features:
 - IPNS record interception and republishing
 - Random re-announcement scheduler for propagation
 - HTTP server for IPNS record capture
+- Version chain validation for IPNS updates
 
 Environment Variables:
     NOSTR_RELAYS: Comma-separated relay URLs
@@ -24,6 +25,11 @@ Environment Variables:
     NOSTR_PRIVATE_KEY: Hex private key for publishing (optional)
     ANNOUNCE_INTERVAL: Re-announcement interval in seconds (default: 0 = use probability)
     ANNOUNCE_PROBABILITY: Probability per second of re-announcement (default: 0.000277778 = 1/3600)
+    CHAIN_VALIDATION_ENABLED: Enable version chain validation (default: true)
+    CHAIN_VALIDATION_MODE: strict | queue (default: strict)
+    CID_FETCH_TIMEOUT: Timeout for CID content fetches (default: 10)
+    CID_CACHE_SIZE: LRU cache size for CID content (default: 1000)
+    CID_CACHE_TTL: Cache TTL in seconds (default: 60)
 """
 
 import asyncio
@@ -39,7 +45,7 @@ import signal
 import sqlite3
 import sys
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -79,6 +85,13 @@ else:
 
 # Staleness threshold for IPNS records - records older than this trigger async DHT sync
 STALE_THRESHOLD_SECONDS = int(os.getenv("STALE_THRESHOLD_SECONDS", "60"))
+
+# Chain validation configuration
+CHAIN_VALIDATION_ENABLED = os.getenv("CHAIN_VALIDATION_ENABLED", "true").lower() == "true"
+CHAIN_VALIDATION_MODE = os.getenv("CHAIN_VALIDATION_MODE", "strict")  # strict | queue
+CID_FETCH_TIMEOUT = int(os.getenv("CID_FETCH_TIMEOUT", "10"))
+CID_CACHE_SIZE = int(os.getenv("CID_CACHE_SIZE", "1000"))
+CID_CACHE_TTL = int(os.getenv("CID_CACHE_TTL", "60"))
 
 # CID validation regex (CIDv0 and CIDv1)
 CID_REGEX = re.compile(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z][a-z2-7]{50,}|bag[a-z][a-z2-7]{50,})$')
@@ -122,6 +135,10 @@ class Metrics:
     ipns_records_stored: int = 0
     reannouncements: int = 0
     nostr_events_received: int = 0
+    chain_validations_passed: int = 0
+    chain_validations_failed_break: int = 0
+    chain_validations_failed_fetch: int = 0
+    chain_validations_skipped: int = 0
     start_time: float = field(default_factory=time.time)
 
 
@@ -169,12 +186,92 @@ def init_database(db_path: str) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Add last_cid column for chain validation
+    try:
+        cursor.execute("ALTER TABLE ipns_records ADD COLUMN last_cid TEXT")
+        logger.info("Added last_cid column to ipns_records table")
+    except sqlite3.OperationalError:
+        pass
+
+    # Add version column from _meta
+    try:
+        cursor.execute("ALTER TABLE ipns_records ADD COLUMN version INTEGER DEFAULT 0")
+        logger.info("Added version column to ipns_records table")
+    except sqlite3.OperationalError:
+        pass
+
+    # Add lock_version column for optimistic locking (separate from content version)
+    try:
+        cursor.execute("ALTER TABLE ipns_records ADD COLUMN lock_version INTEGER DEFAULT 0")
+        logger.info("Added lock_version column to ipns_records table")
+    except sqlite3.OperationalError:
+        pass
+
+    # Performance indexes for IPNS lookups (critical for <50ms response time)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ipns_name
+        ON ipns_records(ipns_name)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ipns_last_updated
+        ON ipns_records(last_updated DESC)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ipns_sequence
+        ON ipns_records(sequence DESC)
+    """)
+
+    # Create forensic log table for chain breaks
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chain_validation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ipns_name TEXT NOT NULL,
+            violation_type TEXT NOT NULL,
+            current_cid TEXT,
+            rejected_cid TEXT,
+            rejected_sequence INTEGER,
+            expected_lastcid TEXT,
+            actual_lastcid TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            details TEXT
+        )
+    """)
+
+    # Create indexes for forensic log queries
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chain_log_ipns
+        ON chain_validation_log(ipns_name)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chain_log_timestamp
+        ON chain_validation_log(timestamp DESC)
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS metrics (
             key TEXT PRIMARY KEY,
             value INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+
+    # Forensic events table for comprehensive logging (async, non-blocking)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS forensic_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT (datetime('now')),
+            event_type TEXT NOT NULL,
+            ipns_name TEXT NOT NULL,
+            details TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_forensic_timestamp
+        ON forensic_events(timestamp DESC)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_forensic_ipns
+        ON forensic_events(ipns_name)
     """)
 
     conn.commit()
@@ -274,6 +371,337 @@ def parse_ipns_record(record_bytes: bytes) -> tuple[int, str | None]:
         cid = value[6:]  # Remove /ipfs/ prefix
 
     return (sequence, cid)
+
+
+# ==========================================
+# CID Content Cache
+# ==========================================
+
+class CidContentCache:
+    """LRU cache for CID content to avoid repeated fetches."""
+
+    def __init__(self, max_size: int = 1000, ttl: int = 60):
+        self.cache: OrderedDict[str, tuple[dict, float]] = OrderedDict()  # cid -> (content, expiry)
+        self.max_size = max_size
+        self.ttl = ttl
+        self.lock = asyncio.Lock()
+
+    async def get(self, cid: str) -> Optional[dict]:
+        """Get cached content if not expired. Moves to end for LRU tracking."""
+        try:
+            async with asyncio.timeout(5):  # 5-second timeout to prevent deadlock
+                async with self.lock:
+                    if cid in self.cache:
+                        content, expiry = self.cache[cid]
+                        if time.time() < expiry:
+                            self.cache.move_to_end(cid)  # Mark as recently used
+                            return content
+                        del self.cache[cid]
+        except asyncio.TimeoutError:
+            logger.error(f"Cache lock timeout for get({cid[:16]}...)")
+        return None
+
+    async def set(self, cid: str, content: dict):
+        """Cache content with TTL using LRU eviction."""
+        try:
+            async with asyncio.timeout(5):  # 5-second timeout to prevent deadlock
+                async with self.lock:
+                    # Remove oldest (first item) if at capacity
+                    if len(self.cache) >= self.max_size:
+                        self.cache.popitem(last=False)  # Remove oldest (FIFO order)
+
+                    self.cache[cid] = (content, time.time() + self.ttl)
+                    self.cache.move_to_end(cid)  # Ensure it's at the end
+        except asyncio.TimeoutError:
+            logger.error(f"Cache lock timeout for set({cid[:16]}...)")
+
+    def invalidate(self, cid: str):
+        """Remove entry from cache."""
+        if cid in self.cache:
+            del self.cache[cid]
+
+
+# Global cache instance
+_cid_cache: Optional[CidContentCache] = None
+
+def get_cid_cache() -> CidContentCache:
+    global _cid_cache
+    if _cid_cache is None:
+        _cid_cache = CidContentCache(CID_CACHE_SIZE, CID_CACHE_TTL)
+    return _cid_cache
+
+
+async def fetch_cid_content(cid: str, timeout: int = CID_FETCH_TIMEOUT) -> Optional[dict]:
+    """
+    Fetch CID content from local IPFS node with content validation.
+    Returns parsed JSON content or None on failure.
+
+    Validates:
+    - Content is a dict (not list or primitive)
+    - Content has tokens OR _meta field (valid wallet content)
+    - Rejects empty content with only Data/Links fields
+    """
+    cache = get_cid_cache()
+
+    # Check cache first
+    cached = await cache.get(cid)
+    if cached is not None:
+        return cached
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Use IPFS cat API to fetch content
+            response = await client.post(
+                f"{IPFS_API_URL}/api/v0/cat",
+                params={"arg": cid}
+            )
+
+            if response.status_code != 200:
+                logger.warning(f"CID fetch failed for {cid[:16]}...: status={response.status_code}")
+                return None
+
+            # Parse JSON content
+            content = response.json()
+
+            # Validate content has expected structure
+            if not isinstance(content, dict):
+                logger.warning(f"CID {cid[:16]}... contains non-dict content (type={type(content).__name__})")
+                return None
+
+            # Check for token data OR _meta field (valid wallet content)
+            # IPFS empty nodes typically have only Data/Links fields
+            ipfs_internal_keys = {'Data', 'Links'}
+            actual_keys = set(content.keys())
+            non_ipfs_keys = actual_keys - ipfs_internal_keys
+
+            has_tokens = any(k not in ('_meta', 'Data', 'Links') for k in content.keys())
+            has_meta = '_meta' in content and isinstance(content.get('_meta'), dict)
+
+            if not has_tokens and not has_meta:
+                # Content appears empty or has only IPFS internal fields
+                if non_ipfs_keys:
+                    # Has some custom keys but no tokens or meta - might be valid, log warning
+                    logger.debug(f"CID {cid[:16]}... has custom keys but no tokens/_meta: {non_ipfs_keys}")
+                else:
+                    # Only Data/Links - definitely empty
+                    logger.warning(f"CID {cid[:16]}... appears empty (only Data/Links), not caching")
+                    return None
+
+            await cache.set(cid, content)
+            return content
+
+    except httpx.TimeoutException:
+        logger.warning(f"CID fetch timeout for {cid[:16]}...")
+        return None
+    except json.JSONDecodeError as e:
+        logger.warning(f"CID content not valid JSON for {cid[:16]}...: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"CID fetch error for {cid[:16]}...: {e}")
+        return None
+
+
+@dataclass
+class ChainValidationResult:
+    """Result of chain validation."""
+    valid: bool
+    reason: str
+    last_cid: Optional[str] = None
+    version: Optional[int] = None
+
+
+async def validate_version_chain(
+    ipns_name: str,
+    new_cid: str,
+    current_cid: Optional[str],
+    new_sequence: int,
+    current_sequence: int,
+    db: sqlite3.Connection,
+    metrics: Metrics
+) -> ChainValidationResult:
+    """
+    Validate that new CID maintains version chain integrity.
+
+    Rules:
+    1. First record (no current_cid): Accept, lastCid should be null
+    2. Same CID (republish): Accept
+    3. New CID: Must have _meta.lastCid == current_cid
+
+    Escape hatches:
+    - Sequence jump >5: Bypasses chain validation (indicates multi-device conflict)
+    - log_only mode: Accepts records but logs violations for forensics
+    """
+
+    if not CHAIN_VALIDATION_ENABLED:
+        metrics.chain_validations_skipped += 1
+        return ChainValidationResult(valid=True, reason="validation_disabled")
+
+    # Escape hatch: Large sequence jumps bypass chain validation
+    # (Indicates multi-device conflict or recovery, not corruption)
+    sequence_delta = new_sequence - current_sequence
+    if sequence_delta > 5:
+        logger.warning(
+            f"Sequence jump detected for {ipns_name[:16]}...: "
+            f"{current_sequence} -> {new_sequence} (delta={sequence_delta}), bypassing chain validation"
+        )
+        metrics.chain_validations_skipped += 1
+        return ChainValidationResult(valid=True, reason="sequence_jump_bypass")
+
+    # Case 1: First record for this IPNS name
+    if current_cid is None:
+        # Fetch new CID to verify it's a valid bootstrap (no lastCid)
+        content = await fetch_cid_content(new_cid)
+        if content is None:
+            if CHAIN_VALIDATION_MODE == "strict":
+                metrics.chain_validations_failed_fetch += 1
+                return ChainValidationResult(valid=False, reason="fetch_failed_bootstrap")
+            else:
+                metrics.chain_validations_skipped += 1
+                return ChainValidationResult(valid=True, reason="fetch_failed_optimistic")
+
+        meta = content.get('_meta', {})
+        last_cid = meta.get('lastCid')
+        version = meta.get('version', 1)
+
+        # Bootstrap record should NOT have lastCid (or it should be empty)
+        if last_cid:
+            logger.warning(
+                f"CHAIN BREAK: Bootstrap record for {ipns_name[:16]}... has unexpected lastCid"
+            )
+            _log_chain_violation(
+                db, ipns_name, "invalid_bootstrap",
+                None, new_cid, new_sequence, None, last_cid
+            )
+            metrics.chain_validations_failed_break += 1
+
+            # In log_only mode: accept the record but log the violation
+            if CHAIN_VALIDATION_MODE == "log_only":
+                logger.warning(
+                    f"Invalid bootstrap accepted in log_only mode for {ipns_name[:16]}..."
+                )
+                return ChainValidationResult(valid=True, reason="invalid_bootstrap_logged", last_cid=last_cid, version=version)
+
+            return ChainValidationResult(valid=False, reason="invalid_bootstrap_lastcid")
+
+        metrics.chain_validations_passed += 1
+        # Bootstrap has no lastCid (it's the first version)
+        return ChainValidationResult(valid=True, reason="valid_bootstrap", last_cid=None, version=version)
+
+    # Case 2: Same CID (republish with higher sequence)
+    if new_cid == current_cid:
+        metrics.chain_validations_passed += 1
+        # Republish doesn't change the chain - preserve existing lastCid
+        return ChainValidationResult(valid=True, reason="republish", last_cid=current_cid, version=0)
+
+    # Case 3: New CID - validate chain continuity
+    content = await fetch_cid_content(new_cid)
+    if content is None:
+        if CHAIN_VALIDATION_MODE == "strict":
+            logger.warning(
+                f"CHAIN VALIDATION BLOCKED: Cannot fetch CID {new_cid[:16]}... for {ipns_name[:16]}..."
+            )
+            metrics.chain_validations_failed_fetch += 1
+            return ChainValidationResult(valid=False, reason="fetch_failed_strict")
+        else:
+            logger.warning(
+                f"CHAIN VALIDATION SKIPPED: Fetch failed for {new_cid[:16]}..., accepting in queue mode"
+            )
+            metrics.chain_validations_skipped += 1
+            return ChainValidationResult(valid=True, reason="fetch_failed_queue")
+
+    meta = content.get('_meta', {})
+    last_cid = meta.get('lastCid')
+    version = meta.get('version', 0)
+
+    # Validate chain: lastCid must equal current_cid
+    if last_cid != current_cid:
+        logger.error(
+            f"CHAIN BREAK DETECTED for {ipns_name[:16]}...\n"
+            f"  Current CID:      {current_cid}\n"
+            f"  New CID:          {new_cid}\n"
+            f"  New _meta.lastCid: {last_cid}\n"
+            f"  Expected lastCid to equal current CID!"
+        )
+        _log_chain_violation(
+            db, ipns_name, "chain_break",
+            current_cid, new_cid, new_sequence, current_cid, last_cid
+        )
+        metrics.chain_validations_failed_break += 1
+
+        # In log_only mode: accept the record but log the violation
+        if CHAIN_VALIDATION_MODE == "log_only":
+            logger.warning(
+                f"Chain break accepted in log_only mode for {ipns_name[:16]}..."
+            )
+            return ChainValidationResult(valid=True, reason="chain_break_logged", last_cid=last_cid, version=version)
+
+        # In strict mode: reject the record
+        return ChainValidationResult(valid=False, reason="chain_break", last_cid=last_cid)
+
+    logger.info(
+        f"CHAIN VALID: {ipns_name[:16]}... seq={new_sequence} v={version}"
+    )
+    metrics.chain_validations_passed += 1
+    return ChainValidationResult(valid=True, reason="valid_chain", last_cid=last_cid, version=version)
+
+
+def _log_chain_violation(
+    db: sqlite3.Connection,
+    ipns_name: str,
+    violation_type: str,
+    current_cid: Optional[str],
+    rejected_cid: str,
+    rejected_sequence: int,
+    expected_lastcid: Optional[str],
+    actual_lastcid: Optional[str]
+):
+    """Log chain validation violation for forensic analysis."""
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            """INSERT INTO chain_validation_log
+               (ipns_name, violation_type, current_cid, rejected_cid,
+                rejected_sequence, expected_lastcid, actual_lastcid)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (ipns_name, violation_type, current_cid, rejected_cid,
+             rejected_sequence, expected_lastcid, actual_lastcid)
+        )
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to log chain violation: {e}")
+
+
+async def _log_forensic_event_async(
+    db: sqlite3.Connection,
+    event_type: str,
+    ipns_name: str,
+    details: dict
+):
+    """
+    Async forensic logging (non-blocking).
+    Logs to forensic_events table for debugging and analysis.
+    """
+    # Schedule the actual write as a background task to avoid blocking
+    asyncio.create_task(_write_forensic_log(db, event_type, ipns_name, details))
+
+
+async def _write_forensic_log(
+    db: sqlite3.Connection,
+    event_type: str,
+    ipns_name: str,
+    details: dict
+):
+    """Background log writer for forensic events."""
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            """INSERT INTO forensic_events (event_type, ipns_name, details)
+               VALUES (?, ?, ?)""",
+            (event_type, ipns_name, json.dumps(details))
+        )
+        db.commit()
+    except Exception as e:
+        logger.error(f"Forensic log failed: {e}")
 
 
 # ==========================================
@@ -416,50 +844,134 @@ class IpnsRecordStore:
         self.db = db
         self.metrics = metrics
 
-    def store_record(self, ipns_name: str, record_bytes: bytes, cid: Optional[str] = None) -> bool:
+    async def store_record(self, ipns_name: str, record_bytes: bytes, cid: Optional[str] = None) -> bool:
         """
         Store an IPNS record for later republishing.
-        Only stores if the new record has a sequence >= existing sequence.
+        Uses optimistic locking to prevent race conditions.
 
-        Returns True if stored, False if rejected due to lower sequence.
+        Validates:
+        1. Sequence number >= existing sequence
+        2. Version chain integrity (new CID's _meta.lastCid == current CID)
+
+        Returns True if stored, False if rejected.
         """
-        try:
-            # Parse the incoming record to get sequence and CID
-            new_sequence, parsed_cid = parse_ipns_record(record_bytes)
-            if cid is None and parsed_cid:
-                cid = parsed_cid
+        max_retries = 3
 
-            cursor = self.db.cursor()
+        for attempt in range(max_retries):
+            try:
+                # Parse the incoming record to get sequence and CID
+                new_sequence, parsed_cid = parse_ipns_record(record_bytes)
+                if cid is None and parsed_cid:
+                    cid = parsed_cid
 
-            # Check existing sequence
-            cursor.execute(
-                'SELECT sequence FROM ipns_records WHERE ipns_name = ?',
-                (ipns_name,)
-            )
-            row = cursor.fetchone()
-            existing_sequence = row['sequence'] if row else 0
+                cursor = self.db.cursor()
 
-            # Only store if new sequence is >= existing (allows same seq for updates)
-            if new_sequence < existing_sequence:
-                logger.warning(
-                    f"Rejecting IPNS record for {ipns_name[:16]}...: "
-                    f"new seq={new_sequence} < existing seq={existing_sequence}"
+                # Get existing record state (including lock_version for optimistic locking)
+                cursor.execute(
+                    'SELECT cid, sequence, last_cid, version, lock_version FROM ipns_records WHERE ipns_name = ?',
+                    (ipns_name,)
                 )
-                return False
+                row = cursor.fetchone()
 
-            cursor.execute(
-                """INSERT OR REPLACE INTO ipns_records
-                   (ipns_name, marshalled_record, cid, sequence, last_updated)
-                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                (ipns_name, record_bytes, cid, new_sequence)
-            )
-            self.db.commit()
-            self.metrics.ipns_records_stored += 1
-            logger.info(f"Stored IPNS record: {ipns_name[:16]}... seq={new_sequence}")
-            return True
-        except Exception as e:
-            logger.error(f"Error storing IPNS record: {e}")
-            return False
+                current_cid = row['cid'] if row else None
+                existing_sequence = row['sequence'] if row else 0
+                db_lock_version = row['lock_version'] if row and row['lock_version'] else 0
+
+                # Sequence validation with anomaly detection
+                if new_sequence < existing_sequence:
+                    sequence_delta = existing_sequence - new_sequence
+
+                    # Check for anomaly: is this a legitimate rollback or cache corruption?
+                    if sequence_delta > 100:
+                        # Major anomaly - the cached sequence is likely wrong
+                        # This can happen with multi-device conflicts or cache corruption
+                        logger.error(
+                            f"SEQUENCE ANOMALY DETECTED for {ipns_name[:16]}...: "
+                            f"cached seq={existing_sequence}, incoming seq={new_sequence}, delta={sequence_delta}"
+                        )
+                        # Log forensic event and accept the new record (recovery path)
+                        await _log_forensic_event_async(
+                            self.db, "sequence_anomaly", ipns_name,
+                            {
+                                "cached_sequence": existing_sequence,
+                                "incoming_sequence": new_sequence,
+                                "delta": sequence_delta,
+                                "action": "accepting_new_record"
+                            }
+                        )
+                        # Fall through to store the record (don't return False)
+                    else:
+                        # Normal case: reject lower sequence
+                        logger.warning(
+                            f"Rejecting IPNS record for {ipns_name[:16]}...: "
+                            f"new seq={new_sequence} < existing seq={existing_sequence}"
+                        )
+                        return False
+
+                # Chain validation (if we have a CID to validate)
+                if cid:
+                    validation = await validate_version_chain(
+                        ipns_name, cid, current_cid,
+                        new_sequence, existing_sequence,
+                        self.db, self.metrics
+                    )
+
+                    if not validation.valid:
+                        logger.warning(
+                            f"Rejecting IPNS record for {ipns_name[:16]}...: "
+                            f"chain validation failed: {validation.reason}"
+                        )
+                        return False
+
+                    # Extract version and lastCid from validation result
+                    version = validation.version if validation.version else 0
+                    # Store the _meta.lastCid from the new content (chain link)
+                    last_cid_to_store = validation.last_cid
+                else:
+                    version = 0
+                    last_cid_to_store = None
+
+                # Store the record with optimistic locking (using lock_version, not content version)
+                if row is None:
+                    # INSERT for new records (lock_version starts at 1)
+                    cursor.execute(
+                        """INSERT INTO ipns_records
+                           (ipns_name, marshalled_record, cid, sequence, last_cid, version, lock_version, last_updated)
+                           VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)""",
+                        (ipns_name, record_bytes, cid, new_sequence, last_cid_to_store, version)
+                    )
+                else:
+                    # UPDATE with lock_version check (optimistic lock)
+                    # Atomically increment lock_version to prevent race conditions
+                    cursor.execute(
+                        """UPDATE ipns_records
+                           SET marshalled_record=?, cid=?, sequence=?, last_cid=?, version=?,
+                               lock_version = lock_version + 1, last_updated=CURRENT_TIMESTAMP
+                           WHERE ipns_name = ? AND lock_version = ?""",
+                        (record_bytes, cid, new_sequence, last_cid_to_store, version, ipns_name, db_lock_version)
+                    )
+
+                    if cursor.rowcount == 0:
+                        # Another update happened concurrently, retry
+                        logger.warning(
+                            f"Concurrent update detected for {ipns_name[:16]}..., "
+                            f"retrying (attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                        continue
+
+                self.db.commit()
+                self.metrics.ipns_records_stored += 1
+                logger.info(f"Stored IPNS record: {ipns_name[:16]}... seq={new_sequence} v={version}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Error storing IPNS record (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    return False
+                await asyncio.sleep(0.1 * (attempt + 1))
+
+        return False
 
     def get_all_records(self) -> list[tuple[str, bytes]]:
         """Get all stored IPNS records."""
@@ -601,7 +1113,7 @@ class DhtSyncWorker:
                         f"DHT sync: updating {ipns_name[:16]}... "
                         f"seq {db_sequence} -> {kubo_sequence}"
                     )
-                    self.ipns_store.store_record(ipns_name, record_bytes)
+                    await self.ipns_store.store_record(ipns_name, record_bytes)
 
                     # Notify WebSocket subscribers of update
                     await self.subscription_manager.notify(
@@ -994,7 +1506,7 @@ class IpnsInterceptServer:
                     return web.Response(status=400, text="Invalid record format")
 
                 logger.info(f"Storing IPNS record for {ipns_name[:16]}... ({len(record_bytes)} bytes)")
-                self.ipns_store.store_record(ipns_name, record_bytes)
+                await self.ipns_store.store_record(ipns_name, record_bytes)
                 return web.Response(status=200, text="OK")
             else:
                 return web.Response(status=400, text="Empty body")
@@ -1047,6 +1559,12 @@ class IpnsInterceptServer:
                     "ipns_records_stored": self.metrics.ipns_records_stored,
                     "nostr_events_received": self.metrics.nostr_events_received,
                     "reannouncements": self.metrics.reannouncements
+                },
+                "chain_validation": {
+                    "passed": self.metrics.chain_validations_passed,
+                    "failed_break": self.metrics.chain_validations_failed_break,
+                    "failed_fetch": self.metrics.chain_validations_failed_fetch,
+                    "skipped": self.metrics.chain_validations_skipped,
                 },
                 "relays": len(NOSTR_RELAYS)
             }
@@ -1131,7 +1649,7 @@ class IpnsInterceptServer:
                         sequence, cid = parse_ipns_record(record_bytes)
 
                         # Store in SQLite for future fast lookups
-                        self.ipns_store.store_record(ipns_name, record_bytes)
+                        await self.ipns_store.store_record(ipns_name, record_bytes)
 
                         # Notify WebSocket subscribers
                         await self.subscription_manager.notify(ipns_name, sequence, cid)
@@ -1149,6 +1667,43 @@ class IpnsInterceptServer:
         except Exception as e:
             logger.error(f"DHT fetch error for {ipns_name[:16]}...: {e}")
             return web.Response(status=500, text=str(e))
+
+    async def _refresh_and_push(self, ipns_name: str):
+        """
+        Background refresh with WebSocket notification (non-blocking).
+        Called when serving stale data - refreshes from DHT and pushes update.
+        """
+        try:
+            # Fetch from DHT (up to 10s timeout)
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    f"{IPFS_API_URL}/api/v0/routing/get",
+                    params={"arg": f"/ipns/{ipns_name}"}
+                )
+
+                if response.status_code != 200:
+                    logger.debug(f"Background refresh: DHT returned {response.status_code} for {ipns_name[:16]}...")
+                    return
+
+                kubo_data = response.json()
+                if not kubo_data.get('Extra'):
+                    return
+
+                record_bytes = base64.b64decode(kubo_data['Extra'])
+                sequence, cid = parse_ipns_record(record_bytes)
+
+                # Store in cache (this validates sequence and chain)
+                stored = await self.ipns_store.store_record(ipns_name, record_bytes)
+
+                if stored:
+                    # Push to all subscribed clients via WebSocket
+                    await self.subscription_manager.notify(ipns_name, sequence, cid)
+                    logger.info(f"Background refresh complete: {ipns_name[:16]}... seq={sequence}")
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Background refresh timeout for {ipns_name[:16]}...")
+        except Exception as e:
+            logger.error(f"Background refresh failed for {ipns_name[:16]}...: {e}")
 
     async def _handle_routing_get(self, request: web.Request) -> web.Response:
         """
@@ -1188,13 +1743,36 @@ class IpnsInterceptServer:
                 db_sequence = row['sequence'] or 0
                 last_updated = row['last_updated']
 
-                # Check staleness and trigger async DHT sync if needed
-                if self._is_stale(last_updated):
-                    # Non-blocking: queue DHT sync task
-                    asyncio.create_task(self.dht_sync_worker.sync_record(ipns_name))
-                    logger.debug(f"routing-get: Queued async DHT sync for stale record {ipns_name[:16]}...")
+                # Calculate age in seconds for staleness headers
+                age_seconds = 0
+                is_stale = False
+                try:
+                    if last_updated:
+                        if last_updated.endswith('Z'):
+                            updated_time = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                            age_seconds = (datetime.now(updated_time.tzinfo) - updated_time).total_seconds()
+                        elif '+' in last_updated:
+                            updated_time = datetime.fromisoformat(last_updated)
+                            age_seconds = (datetime.now(updated_time.tzinfo) - updated_time).total_seconds()
+                        else:
+                            updated_time = datetime.fromisoformat(last_updated)
+                            age_seconds = (datetime.utcnow() - updated_time).total_seconds()
+                        is_stale = age_seconds > STALE_THRESHOLD_SECONDS
+                    else:
+                        is_stale = True
+                        age_seconds = STALE_THRESHOLD_SECONDS + 1
+                except Exception:
+                    is_stale = True
+                    age_seconds = STALE_THRESHOLD_SECONDS + 1
 
-                # Return immediately from SQLite
+                # ALWAYS return cached data immediately (maintains <50ms target)
+                # If stale, trigger non-blocking background refresh
+                if is_stale:
+                    # Non-blocking: queue DHT sync task with WebSocket push
+                    asyncio.create_task(self._refresh_and_push(ipns_name))
+                    logger.debug(f"routing-get: Queued async DHT sync for stale record {ipns_name[:16]}... (age={int(age_seconds)}s)")
+
+                # Return immediately from SQLite with staleness headers
                 response_data = {
                     "Extra": base64.b64encode(db_record).decode('ascii'),
                     "Type": 5
@@ -1206,7 +1784,10 @@ class IpnsInterceptServer:
                     headers={
                         'X-IPNS-Source': 'sidecar-cache',
                         'X-IPNS-Sequence': str(db_sequence),
-                        'X-IPNS-Last-Updated': last_updated or ''
+                        'X-IPNS-Last-Updated': last_updated or '',
+                        'X-IPNS-Age': str(int(age_seconds)),
+                        'X-IPNS-Stale': 'true' if is_stale else 'false',
+                        'Cache-Control': f'max-age={STALE_THRESHOLD_SECONDS}, stale-while-revalidate=30'
                     }
                 )
             else:
@@ -1470,6 +2051,7 @@ async def main():
     logger.info(f"  Database:       {DB_PATH}")
     logger.info(f"  Node name:      {NODE_NAME}")
     logger.info(f"  Stale threshold: {STALE_THRESHOLD_SECONDS}s")
+    logger.info(f"  Chain validation: {CHAIN_VALIDATION_ENABLED} (mode: {CHAIN_VALIDATION_MODE})")
     logger.info("=" * 60)
 
     # Wait for IPFS to be available
@@ -1561,6 +2143,11 @@ async def main():
     logger.info(f"  IPNS stored:      {metrics.ipns_records_stored}")
     logger.info(f"  Re-announcements: {metrics.reannouncements}")
     logger.info(f"  Nostr events:     {metrics.nostr_events_received}")
+    logger.info(f"  Chain validation:")
+    logger.info(f"    Passed:         {metrics.chain_validations_passed}")
+    logger.info(f"    Failed (break): {metrics.chain_validations_failed_break}")
+    logger.info(f"    Failed (fetch): {metrics.chain_validations_failed_fetch}")
+    logger.info(f"    Skipped:        {metrics.chain_validations_skipped}")
     logger.info("=" * 40)
 
     logger.info("Shutdown complete")
