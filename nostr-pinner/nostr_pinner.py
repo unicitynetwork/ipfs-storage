@@ -877,36 +877,33 @@ class IpnsRecordStore:
                 existing_sequence = row['sequence'] if row else 0
                 db_lock_version = row['lock_version'] if row and row['lock_version'] else 0
 
-                # Sequence validation with anomaly detection
-                if new_sequence < existing_sequence:
+                # Sequence validation: ALWAYS reject lower or equal sequences
+                # This is critical for preventing token loss from stale/replayed records
+                if new_sequence <= existing_sequence:
                     sequence_delta = existing_sequence - new_sequence
 
-                    # Check for anomaly: is this a legitimate rollback or cache corruption?
+                    # Log anomaly if delta is suspiciously large (for forensics only)
                     if sequence_delta > 100:
-                        # Major anomaly - the cached sequence is likely wrong
-                        # This can happen with multi-device conflicts or cache corruption
                         logger.error(
                             f"SEQUENCE ANOMALY DETECTED for {ipns_name[:16]}...: "
                             f"cached seq={existing_sequence}, incoming seq={new_sequence}, delta={sequence_delta}"
                         )
-                        # Log forensic event and accept the new record (recovery path)
                         await _log_forensic_event_async(
                             self.db, "sequence_anomaly", ipns_name,
                             {
                                 "cached_sequence": existing_sequence,
                                 "incoming_sequence": new_sequence,
                                 "delta": sequence_delta,
-                                "action": "accepting_new_record"
+                                "action": "rejected"
                             }
                         )
-                        # Fall through to store the record (don't return False)
-                    else:
-                        # Normal case: reject lower sequence
-                        logger.warning(
-                            f"Rejecting IPNS record for {ipns_name[:16]}...: "
-                            f"new seq={new_sequence} < existing seq={existing_sequence}"
-                        )
-                        return False
+
+                    # ALWAYS reject - no exceptions for lower/equal sequences
+                    logger.warning(
+                        f"Rejecting IPNS record for {ipns_name[:16]}...: "
+                        f"new seq={new_sequence} <= existing seq={existing_sequence}"
+                    )
+                    return False
 
                 # Chain validation (if we have a CID to validate)
                 if cid:
