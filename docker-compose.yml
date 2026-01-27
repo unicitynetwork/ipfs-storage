@@ -45,7 +45,7 @@ services:
       - ANNOUNCE_PROBABILITY=${ANNOUNCE_PROBABILITY:-0.000277778}
       # IPNS staleness and chain validation configuration (critical bug fixes)
       - STALE_THRESHOLD_SECONDS=${STALE_THRESHOLD_SECONDS:-15}
-      - CHAIN_VALIDATION_MODE=${CHAIN_VALIDATION_MODE:-log_only}
+      - CHAIN_VALIDATION_MODE=${CHAIN_VALIDATION_MODE:-strict}
       - CID_FETCH_TIMEOUT=${CID_FETCH_TIMEOUT:-3}
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
