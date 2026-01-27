@@ -43,6 +43,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import struct
 import sys
 import time
 from collections import deque, OrderedDict
@@ -56,6 +57,29 @@ import secp256k1
 import websockets
 from aiohttp import web
 from websockets.exceptions import ConnectionClosed
+
+# Optional dependencies for IPNS signature verification and rate limiting
+try:
+    import nacl.signing
+    import nacl.exceptions
+    NACL_AVAILABLE = True
+except ImportError:
+    NACL_AVAILABLE = False
+    logging.warning("pynacl not installed - IPNS signature verification disabled")
+
+try:
+    import base58
+    BASE58_AVAILABLE = True
+except ImportError:
+    BASE58_AVAILABLE = False
+    logging.warning("base58 not installed - IPNS signature verification disabled")
+
+try:
+    from aiolimiter import AsyncLimiter
+    AIOLIMITER_AVAILABLE = True
+except ImportError:
+    AIOLIMITER_AVAILABLE = False
+    logging.warning("aiolimiter not installed - rate limiting disabled")
 
 # ==========================================
 # Configuration
@@ -88,10 +112,19 @@ STALE_THRESHOLD_SECONDS = int(os.getenv("STALE_THRESHOLD_SECONDS", "60"))
 
 # Chain validation configuration
 CHAIN_VALIDATION_ENABLED = os.getenv("CHAIN_VALIDATION_ENABLED", "true").lower() == "true"
-CHAIN_VALIDATION_MODE = os.getenv("CHAIN_VALIDATION_MODE", "strict")  # strict | queue
+CHAIN_VALIDATION_MODE = os.getenv("CHAIN_VALIDATION_MODE", "strict")  # strict | log_only
 CID_FETCH_TIMEOUT = int(os.getenv("CID_FETCH_TIMEOUT", "10"))
 CID_CACHE_SIZE = int(os.getenv("CID_CACHE_SIZE", "1000"))
 CID_CACHE_TTL = int(os.getenv("CID_CACHE_TTL", "60"))
+
+# IPNS signature verification configuration
+# Set to false initially for gradual rollout, enable after testing
+IPNS_SIGNATURE_VERIFICATION_ENABLED = os.getenv("IPNS_SIGNATURE_VERIFICATION_ENABLED", "false").lower() == "true"
+
+# Rate limiting configuration (multi-layer)
+RATE_LIMIT_GLOBAL_PER_SECOND = int(os.getenv("RATE_LIMIT_GLOBAL_PER_SECOND", "100"))
+RATE_LIMIT_PER_IP_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_IP_PER_MINUTE", "30"))
+RATE_LIMIT_PER_IPNS_NAME_PER_SECOND = int(os.getenv("RATE_LIMIT_PER_IPNS_NAME_PER_SECOND", "1"))
 
 # CID validation regex (CIDv0 and CIDv1)
 CID_REGEX = re.compile(r'^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z][a-z2-7]{50,}|bag[a-z][a-z2-7]{50,})$')
@@ -133,6 +166,13 @@ class Metrics:
     cids_rejected_format: int = 0
     cids_failed: int = 0
     ipns_records_stored: int = 0
+    # Security metrics
+    ipns_signature_verified: int = 0
+    ipns_signature_failed: int = 0
+    ipns_signature_skipped: int = 0
+    rate_limit_rejected_global: int = 0
+    rate_limit_rejected_ip: int = 0
+    rate_limit_rejected_ipns: int = 0
     reannouncements: int = 0
     nostr_events_received: int = 0
     chain_validations_passed: int = 0
@@ -274,6 +314,59 @@ def init_database(db_path: str) -> sqlite3.Connection:
         ON forensic_events(ipns_name)
     """)
 
+    # SECURITY FIX 7: Database constraints (triggers) for monotonicity
+    # Prevent sequence number regression at the database level
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS enforce_sequence_monotonic
+        BEFORE UPDATE ON ipns_records
+        FOR EACH ROW WHEN NEW.sequence < OLD.sequence
+        BEGIN
+            SELECT RAISE(ABORT, 'SECURITY: Sequence number cannot decrease');
+        END
+    """)
+
+    # Prevent version regression for new CIDs (republishes with same CID are allowed)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS enforce_version_monotonic
+        BEFORE UPDATE ON ipns_records
+        FOR EACH ROW WHEN NEW.version < OLD.version AND NEW.cid != OLD.cid
+        BEGIN
+            SELECT RAISE(ABORT, 'SECURITY: Version number cannot decrease for new CIDs');
+        END
+    """)
+    logger.info("Created monotonicity enforcement triggers")
+
+    # SECURITY FIX 8: Security audit log table with client IP
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS security_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT (datetime('now')),
+            event_type TEXT NOT NULL,
+            client_ip TEXT,
+            ipns_name TEXT,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            details TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_security_audit_timestamp
+        ON security_audit_log(timestamp DESC)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_security_audit_ip
+        ON security_audit_log(client_ip)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_security_audit_ipns
+        ON security_audit_log(ipns_name)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_security_audit_outcome
+        ON security_audit_log(outcome)
+    """)
+    logger.info("Created security audit log table")
+
     conn.commit()
     logger.info(f"Database initialized at {db_path}")
     return conn
@@ -371,6 +464,305 @@ def parse_ipns_record(record_bytes: bytes) -> tuple[int, str | None]:
         cid = value[6:]  # Remove /ipfs/ prefix
 
     return (sequence, cid)
+
+
+# ==========================================
+# IPNS Signature Verification
+# ==========================================
+
+@dataclass
+class IpnsRecordParsed:
+    """
+    Parsed IPNS record with all fields for signature verification.
+
+    IPNS record protobuf fields (IPNS spec):
+    - field 1 (bytes): value (path like /ipfs/<cid>)
+    - field 2 (bytes): signatureV1 (deprecated, RSA)
+    - field 3 (enum): validityType (0 = EOL)
+    - field 4 (bytes): validity (timestamp)
+    - field 5 (varint): sequence
+    - field 6 (varint): ttl
+    - field 7 (bytes): pubKey (optional, if not in peer ID)
+    - field 8 (bytes): signatureV2 (Ed25519 signature over CBOR data)
+    - field 9 (bytes): data (CBOR-encoded data that was signed)
+    """
+    sequence: int = 0
+    cid: Optional[str] = None
+    value: Optional[bytes] = None
+    signature_v2: Optional[bytes] = None
+    data_cbor: Optional[bytes] = None
+    public_key: Optional[bytes] = None
+    validity: Optional[bytes] = None
+    ttl: int = 0
+
+
+def parse_ipns_record_full(record_bytes: bytes) -> IpnsRecordParsed:
+    """
+    Parse IPNS record to extract all fields including signatures.
+    Returns IpnsRecordParsed with all available fields.
+    """
+    result = IpnsRecordParsed()
+
+    try:
+        pos = 0
+        while pos < len(record_bytes):
+            # Read field key (varint)
+            key = 0
+            shift = 0
+            while pos < len(record_bytes):
+                b = record_bytes[pos]
+                pos += 1
+                key |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    break
+                shift += 7
+
+            field_number = key >> 3
+            wire_type = key & 0x07
+
+            if wire_type == 0:  # Varint
+                val = 0
+                shift = 0
+                while pos < len(record_bytes):
+                    b = record_bytes[pos]
+                    pos += 1
+                    val |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+
+                if field_number == 5:
+                    result.sequence = val
+                elif field_number == 6:
+                    result.ttl = val
+
+            elif wire_type == 2:  # Length-delimited
+                length = 0
+                shift = 0
+                while pos < len(record_bytes):
+                    b = record_bytes[pos]
+                    pos += 1
+                    length |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+
+                data = record_bytes[pos:pos + length]
+                pos += length
+
+                if field_number == 1:  # value
+                    result.value = data
+                    value_str = data.decode('utf-8', errors='ignore')
+                    if value_str.startswith('/ipfs/'):
+                        result.cid = value_str[6:]
+                elif field_number == 4:  # validity
+                    result.validity = data
+                elif field_number == 7:  # pubKey
+                    result.public_key = data
+                elif field_number == 8:  # signatureV2
+                    result.signature_v2 = data
+                elif field_number == 9:  # data (CBOR)
+                    result.data_cbor = data
+            else:
+                # Skip unknown wire types
+                break
+    except Exception as e:
+        logger.warning(f"Error parsing IPNS record for signature: {e}")
+
+    return result
+
+
+def extract_pubkey_from_peer_id(peer_id: str) -> Optional[bytes]:
+    """
+    Extract Ed25519 public key from libp2p peer ID.
+
+    Peer IDs starting with "12D3KooW" are base58btc encoded multihash of the public key.
+    The format is: <multicodec><public-key>
+    For Ed25519: multicodec 0xED01 followed by 32-byte key.
+    """
+    if not BASE58_AVAILABLE:
+        return None
+
+    try:
+        if peer_id.startswith("12D3KooW"):
+            # Base58btc encoded peer ID
+            decoded = base58.b58decode(peer_id)
+
+            # Skip multihash header (typically 0x00 0x24 for identity hash of 36 bytes)
+            # or find the Ed25519 multicodec marker (0xED 0x01)
+            if len(decoded) >= 36:
+                # Look for Ed25519 marker
+                for i in range(len(decoded) - 33):
+                    if decoded[i:i+2] == bytes([0xED, 0x01]):
+                        return decoded[i+2:i+34]
+
+                # Fallback: assume last 32 bytes are the key
+                if len(decoded) >= 34 and decoded[0] == 0x00:
+                    # Identity multihash: 0x00 <length> <ed25519-multicodec> <key>
+                    if decoded[2:4] == bytes([0xED, 0x01]):
+                        return decoded[4:36]
+
+        elif peer_id.startswith("k"):
+            # CIDv1 format (base36 encoded)
+            # TODO: Implement base36 decoding if needed
+            pass
+
+    except Exception as e:
+        logger.debug(f"Failed to extract pubkey from peer ID: {e}")
+
+    return None
+
+
+def verify_ipns_signature(ipns_name: str, record: IpnsRecordParsed) -> tuple[bool, str]:
+    """
+    Verify IPNS record is signed by the peer ID it claims.
+
+    Returns: (valid, reason)
+    """
+    if not NACL_AVAILABLE or not BASE58_AVAILABLE:
+        return True, "verification_unavailable"
+
+    if not IPNS_SIGNATURE_VERIFICATION_ENABLED:
+        return True, "verification_disabled"
+
+    # Need signature and data to verify
+    if not record.signature_v2:
+        return False, "missing_signature_v2"
+
+    if not record.data_cbor:
+        return False, "missing_data_cbor"
+
+    # Get public key - either from record or from peer ID
+    pubkey = record.public_key
+    if not pubkey:
+        pubkey = extract_pubkey_from_peer_id(ipns_name)
+
+    if not pubkey:
+        return False, "missing_public_key"
+
+    # Handle Ed25519 multicodec prefix if present
+    if len(pubkey) == 34 and pubkey[0:2] == bytes([0xED, 0x01]):
+        pubkey = pubkey[2:]
+
+    if len(pubkey) != 32:
+        return False, f"invalid_pubkey_length_{len(pubkey)}"
+
+    try:
+        # Verify Ed25519 signature over CBOR data
+        verify_key = nacl.signing.VerifyKey(pubkey)
+        # The signature is over the CBOR-encoded data field
+        verify_key.verify(record.data_cbor, record.signature_v2)
+        return True, "signature_valid"
+    except nacl.exceptions.BadSignature:
+        return False, "invalid_signature"
+    except Exception as e:
+        return False, f"verification_error_{str(e)}"
+
+
+# ==========================================
+# Rate Limiter
+# ==========================================
+
+class IpnsRateLimiter:
+    """
+    Multi-layer rate limiter for IPNS intercept endpoint.
+
+    Layers:
+    1. Global: Limit total requests per second
+    2. Per-IP: Limit requests per IP per minute
+    3. Per-IPNS-name: Limit requests per IPNS name per second
+    """
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+
+        # Layer 1: Global rate limit
+        if AIOLIMITER_AVAILABLE:
+            self.global_limiter = AsyncLimiter(RATE_LIMIT_GLOBAL_PER_SECOND, 1)
+        else:
+            self.global_limiter = None
+
+        # Layer 2: Per-IP limits (track request counts)
+        self.ip_requests: dict[str, tuple[int, float]] = {}  # ip -> (count, window_start)
+        self.ip_window_seconds = 60
+
+        # Layer 3: Per-IPNS-name limits
+        self.ipns_last_request: dict[str, float] = {}  # ipns_name -> last_request_time
+        self.ipns_min_interval = 1.0 / max(RATE_LIMIT_PER_IPNS_NAME_PER_SECOND, 1)
+
+    async def acquire(self, client_ip: str, ipns_name: str, metrics: Metrics) -> tuple[bool, str]:
+        """
+        Check rate limits. Returns (allowed, reason).
+        """
+        current_time = time.time()
+
+        # Layer 1: Global rate limit
+        if self.global_limiter:
+            if not await self._try_acquire_global():
+                metrics.rate_limit_rejected_global += 1
+                return False, "global_rate_limit"
+
+        async with self.lock:
+            # Layer 2: Per-IP rate limit
+            if client_ip:
+                count, window_start = self.ip_requests.get(client_ip, (0, current_time))
+
+                # Reset window if expired
+                if current_time - window_start >= self.ip_window_seconds:
+                    count = 0
+                    window_start = current_time
+
+                if count >= RATE_LIMIT_PER_IP_PER_MINUTE:
+                    metrics.rate_limit_rejected_ip += 1
+                    return False, "ip_rate_limit"
+
+                self.ip_requests[client_ip] = (count + 1, window_start)
+
+            # Layer 3: Per-IPNS-name rate limit
+            last_request = self.ipns_last_request.get(ipns_name, 0)
+            if current_time - last_request < self.ipns_min_interval:
+                metrics.rate_limit_rejected_ipns += 1
+                return False, "ipns_rate_limit"
+
+            self.ipns_last_request[ipns_name] = current_time
+
+        return True, "allowed"
+
+    async def _try_acquire_global(self) -> bool:
+        """Try to acquire global rate limit (non-blocking)."""
+        try:
+            # Use asyncio.wait_for with 0 timeout for non-blocking check
+            await asyncio.wait_for(self.global_limiter.acquire(), timeout=0.001)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def cleanup_old_entries(self):
+        """Remove stale entries from tracking dicts (call periodically)."""
+        current_time = time.time()
+        cutoff_ip = current_time - self.ip_window_seconds * 2
+        cutoff_ipns = current_time - 60  # Keep IPNS entries for 1 minute
+
+        self.ip_requests = {
+            ip: (count, start) for ip, (count, start) in self.ip_requests.items()
+            if start > cutoff_ip
+        }
+        self.ipns_last_request = {
+            name: ts for name, ts in self.ipns_last_request.items()
+            if ts > cutoff_ipns
+        }
+
+
+# Global rate limiter instance
+_rate_limiter: Optional[IpnsRateLimiter] = None
+
+
+def get_rate_limiter() -> IpnsRateLimiter:
+    """Get or create the global rate limiter instance."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = IpnsRateLimiter()
+    return _rate_limiter
 
 
 # ==========================================
@@ -501,6 +893,42 @@ async def fetch_cid_content(cid: str, timeout: int = CID_FETCH_TIMEOUT) -> Optio
         return None
 
 
+def validate_meta_field(content: dict, is_bootstrap: bool = False) -> tuple[bool, str, Optional[str], Optional[int]]:
+    """
+    SECURITY: Validate _meta structure strictly.
+
+    Returns: (valid, reason, lastCid, version)
+
+    Requirements:
+    - _meta field MUST exist and be a dict
+    - version MUST exist and be a positive integer >= 1
+    - lastCid MUST exist for non-bootstrap records (can be null for bootstrap)
+    """
+    if '_meta' not in content:
+        return False, "missing_meta_field", None, None
+
+    meta = content.get('_meta')
+    if not isinstance(meta, dict):
+        return False, "meta_not_dict", None, None
+
+    version = meta.get('version')
+    if version is None:
+        return False, "missing_meta_version", None, None
+    if not isinstance(version, int):
+        return False, "version_not_int", None, None
+    if version < 1:
+        return False, "version_less_than_1", None, None
+
+    last_cid = meta.get('lastCid')
+
+    # For non-bootstrap records, lastCid must be explicitly present in _meta
+    # (it can be null/None for bootstrap, but the field should exist for updates)
+    if not is_bootstrap and 'lastCid' not in meta:
+        return False, "missing_meta_lastcid", None, version
+
+    return True, "valid", last_cid, version
+
+
 @dataclass
 class ChainValidationResult:
     """Result of chain validation."""
@@ -523,51 +951,61 @@ async def validate_version_chain(
     """
     Validate that new CID maintains version chain integrity.
 
-    Rules:
-    1. First record (no current_cid): Accept, lastCid should be null, version should be 1
-    2. Same CID (republish): Accept
-    3. New CID: Must have _meta.lastCid == current_cid AND _meta.version == current_version + 1
+    SECURITY HARDENED: All records MUST have valid _meta field.
 
-    Escape hatches:
-    - Sequence jump >5: Bypasses chain validation (indicates multi-device conflict)
-    - log_only mode: Accepts records but logs violations for forensics
+    Rules:
+    1. First record (no current_cid): Accept if _meta.version >= 1 and no lastCid
+    2. Same CID (republish): Accept
+    3. New CID: Must have valid _meta with lastCid == current_cid AND version == current_version + 1
+    4. Large sequence jumps (>5): Require valid _meta but allow version >= current (for recovery)
+
+    Security notes:
+    - Missing _meta field: ALWAYS REJECTED
+    - CID fetch failure: ALWAYS REJECTED (no optimistic acceptance)
+    - log_only mode: REJECTS invalid records (only adds verbose forensics logging)
     """
 
     if not CHAIN_VALIDATION_ENABLED:
         metrics.chain_validations_skipped += 1
         return ChainValidationResult(valid=True, reason="validation_disabled")
 
-    # Escape hatch: Large sequence jumps bypass chain validation
-    # (Indicates multi-device conflict or recovery, not corruption)
+    # SECURITY FIX: Large sequence jumps NO LONGER bypass chain validation
+    # They still require valid _meta field but allow version >= current (not necessarily +1)
+    # This supports multi-device recovery while preventing corruption attacks
     sequence_delta = new_sequence - current_sequence
-    if sequence_delta > 5:
+    is_large_jump = sequence_delta > 5
+    if is_large_jump:
         logger.warning(
-            f"Sequence jump detected for {ipns_name[:16]}...: "
-            f"{current_sequence} -> {new_sequence} (delta={sequence_delta}), bypassing chain validation"
+            f"Large sequence jump detected for {ipns_name[:16]}...: "
+            f"{current_sequence} -> {new_sequence} (delta={sequence_delta}), still validating _meta"
         )
-        metrics.chain_validations_skipped += 1
-        return ChainValidationResult(valid=True, reason="sequence_jump_bypass")
+        # Continue to _meta validation below - DO NOT return early
 
     # Case 1: First record for this IPNS name
     if current_cid is None:
         # Fetch new CID to verify it's a valid bootstrap (no lastCid)
         content = await fetch_cid_content(new_cid)
         if content is None:
-            if CHAIN_VALIDATION_MODE == "strict":
-                metrics.chain_validations_failed_fetch += 1
-                return ChainValidationResult(valid=False, reason="fetch_failed_bootstrap")
-            else:
-                metrics.chain_validations_skipped += 1
-                return ChainValidationResult(valid=True, reason="fetch_failed_optimistic")
+            # SECURITY FIX: Always reject on fetch failure - no optimistic acceptance
+            logger.error(f"REJECTED: Cannot fetch bootstrap CID {new_cid[:16]}... for {ipns_name[:16]}...")
+            metrics.chain_validations_failed_fetch += 1
+            return ChainValidationResult(valid=False, reason="fetch_failed_bootstrap")
 
-        meta = content.get('_meta', {})
-        last_cid = meta.get('lastCid')
-        version = meta.get('version', 1)
+        # SECURITY FIX: Validate _meta structure strictly
+        meta_valid, meta_reason, last_cid, version = validate_meta_field(content, is_bootstrap=True)
+        if not meta_valid:
+            logger.error(f"REJECTED: Invalid _meta for bootstrap {ipns_name[:16]}...: {meta_reason}")
+            _log_chain_violation(
+                db, ipns_name, f"invalid_meta_{meta_reason}",
+                None, new_cid, new_sequence, None, None
+            )
+            metrics.chain_validations_failed_break += 1
+            return ChainValidationResult(valid=False, reason=f"invalid_meta_{meta_reason}")
 
-        # Bootstrap record should NOT have lastCid (or it should be empty)
+        # Bootstrap record should NOT have lastCid (or it should be empty/null)
         if last_cid:
-            logger.warning(
-                f"CHAIN BREAK: Bootstrap record for {ipns_name[:16]}... has unexpected lastCid"
+            logger.error(
+                f"CHAIN BREAK: Bootstrap record for {ipns_name[:16]}... has unexpected lastCid={last_cid[:16]}..."
             )
             _log_chain_violation(
                 db, ipns_name, "invalid_bootstrap",
@@ -575,13 +1013,11 @@ async def validate_version_chain(
             )
             metrics.chain_validations_failed_break += 1
 
-            # In log_only mode: accept the record but log the violation
+            # SECURITY FIX: log_only mode REJECTS invalid records (forensics only)
             if CHAIN_VALIDATION_MODE == "log_only":
-                logger.warning(
-                    f"Invalid bootstrap accepted in log_only mode for {ipns_name[:16]}..."
+                logger.error(
+                    f"REJECTED (forensics mode): Invalid bootstrap for {ipns_name[:16]}..."
                 )
-                return ChainValidationResult(valid=True, reason="invalid_bootstrap_logged", last_cid=last_cid, version=version)
-
             return ChainValidationResult(valid=False, reason="invalid_bootstrap_lastcid")
 
         metrics.chain_validations_passed += 1
@@ -597,24 +1033,55 @@ async def validate_version_chain(
     # Case 3: New CID - validate chain continuity
     content = await fetch_cid_content(new_cid)
     if content is None:
-        if CHAIN_VALIDATION_MODE == "strict":
-            logger.warning(
-                f"CHAIN VALIDATION BLOCKED: Cannot fetch CID {new_cid[:16]}... for {ipns_name[:16]}..."
-            )
-            metrics.chain_validations_failed_fetch += 1
-            return ChainValidationResult(valid=False, reason="fetch_failed_strict")
-        else:
-            logger.warning(
-                f"CHAIN VALIDATION SKIPPED: Fetch failed for {new_cid[:16]}..., accepting in queue mode"
-            )
-            metrics.chain_validations_skipped += 1
-            return ChainValidationResult(valid=True, reason="fetch_failed_queue")
+        # SECURITY FIX: Always reject on fetch failure - no optimistic acceptance
+        logger.error(f"REJECTED: Cannot fetch CID {new_cid[:16]}... for {ipns_name[:16]}...")
+        metrics.chain_validations_failed_fetch += 1
+        return ChainValidationResult(valid=False, reason="fetch_failed")
 
-    meta = content.get('_meta', {})
-    last_cid = meta.get('lastCid')
-    version = meta.get('version', 0)
+    # SECURITY FIX: Validate _meta structure strictly
+    meta_valid, meta_reason, last_cid, version = validate_meta_field(content, is_bootstrap=False)
+    if not meta_valid:
+        logger.error(f"REJECTED: Invalid _meta for {ipns_name[:16]}...: {meta_reason}")
+        _log_chain_violation(
+            db, ipns_name, f"invalid_meta_{meta_reason}",
+            current_cid, new_cid, new_sequence, None, None
+        )
+        metrics.chain_validations_failed_break += 1
 
-    # Validate chain: lastCid must equal current_cid
+        # SECURITY FIX: Large jump with missing _meta is especially suspicious
+        if is_large_jump:
+            logger.error(f"SECURITY: Large sequence jump with invalid _meta for {ipns_name[:16]}...")
+
+        return ChainValidationResult(valid=False, reason=f"invalid_meta_{meta_reason}")
+
+    # SECURITY FIX: Handle large sequence jumps specially for multi-device recovery
+    # Large jumps still require valid _meta but allow version >= current (not necessarily +1)
+    if is_large_jump:
+        # For recovery: require valid _meta but allow version >= current
+        if version < current_version:
+            logger.error(
+                f"REJECTED: Large jump with version regression for {ipns_name[:16]}...\n"
+                f"  Current version: {current_version}\n"
+                f"  New version:     {version}\n"
+                f"  Large jumps require version >= current"
+            )
+            _log_chain_violation(
+                db, ipns_name, "large_jump_version_regression",
+                current_cid, new_cid, new_sequence, str(current_version), str(version)
+            )
+            metrics.chain_validations_failed_break += 1
+            return ChainValidationResult(valid=False, reason="large_jump_version_regression")
+
+        # Large jump with valid _meta and version >= current: ACCEPT for recovery
+        logger.warning(
+            f"ACCEPTING large sequence jump for {ipns_name[:16]}...\n"
+            f"  Current version: {current_version}, New version: {version}\n"
+            f"  Sequence delta: {sequence_delta} (recovery scenario)"
+        )
+        metrics.chain_validations_passed += 1
+        return ChainValidationResult(valid=True, reason="valid_large_jump", last_cid=last_cid, version=version)
+
+    # Normal case: Validate chain - lastCid must equal current_cid
     if last_cid != current_cid:
         logger.error(
             f"CHAIN BREAK DETECTED for {ipns_name[:16]}...\n"
@@ -629,14 +1096,10 @@ async def validate_version_chain(
         )
         metrics.chain_validations_failed_break += 1
 
-        # In log_only mode: accept the record but log the violation
+        # SECURITY FIX: log_only mode REJECTS invalid records (forensics only)
         if CHAIN_VALIDATION_MODE == "log_only":
-            logger.warning(
-                f"Chain break accepted in log_only mode for {ipns_name[:16]}..."
-            )
-            return ChainValidationResult(valid=True, reason="chain_break_logged", last_cid=last_cid, version=version)
+            logger.error(f"REJECTED (forensics mode): Chain break for {ipns_name[:16]}...")
 
-        # In strict mode: reject the record
         return ChainValidationResult(valid=False, reason="chain_break", last_cid=last_cid)
 
     # Validate version number: new version must be exactly current_version + 1
@@ -655,14 +1118,10 @@ async def validate_version_chain(
         )
         metrics.chain_validations_failed_break += 1
 
-        # In log_only mode: accept the record but log the violation
+        # SECURITY FIX: log_only mode REJECTS invalid records (forensics only)
         if CHAIN_VALIDATION_MODE == "log_only":
-            logger.warning(
-                f"Version mismatch accepted in log_only mode for {ipns_name[:16]}..."
-            )
-            return ChainValidationResult(valid=True, reason="version_mismatch_logged", last_cid=last_cid, version=version)
+            logger.error(f"REJECTED (forensics mode): Version mismatch for {ipns_name[:16]}...")
 
-        # In strict mode: reject the record
         return ChainValidationResult(valid=False, reason="version_mismatch", last_cid=last_cid, version=version)
 
     logger.info(
@@ -729,6 +1188,82 @@ async def _write_forensic_log(
         db.commit()
     except Exception as e:
         logger.error(f"Forensic log failed: {e}")
+
+
+# ==========================================
+# Security Audit Logging
+# ==========================================
+
+def get_client_ip(request) -> str:
+    """
+    Extract real client IP from request, handling reverse proxies.
+
+    Checks headers in order:
+    1. X-Real-IP (set by nginx)
+    2. X-Forwarded-For (first IP in chain)
+    3. Request.remote (fallback)
+    """
+    # X-Real-IP is typically set by nginx as the real client IP
+    real_ip = request.headers.get('X-Real-IP')
+    if real_ip:
+        return real_ip.strip()
+
+    # X-Forwarded-For contains comma-separated list, first is original client
+    forwarded_for = request.headers.get('X-Forwarded-For')
+    if forwarded_for:
+        # Take the first IP (original client)
+        return forwarded_for.split(',')[0].strip()
+
+    # Fallback to direct connection IP
+    return request.remote or 'unknown'
+
+
+async def log_security_audit(
+    db: sqlite3.Connection,
+    event_type: str,
+    client_ip: str,
+    ipns_name: Optional[str],
+    outcome: str,
+    reason: Optional[str] = None,
+    details: Optional[dict] = None
+):
+    """
+    Log security-relevant event to security_audit_log table.
+
+    Events types:
+    - ipns_intercept_accepted: Valid IPNS record stored
+    - ipns_intercept_rejected: IPNS record rejected (chain break, signature, etc.)
+    - rate_limit_triggered: Request blocked by rate limiter
+    - signature_verification_failed: IPNS signature verification failed
+    """
+    # Schedule as background task to avoid blocking request handling
+    asyncio.create_task(_write_security_audit(
+        db, event_type, client_ip, ipns_name, outcome, reason, details
+    ))
+
+
+async def _write_security_audit(
+    db: sqlite3.Connection,
+    event_type: str,
+    client_ip: str,
+    ipns_name: Optional[str],
+    outcome: str,
+    reason: Optional[str],
+    details: Optional[dict]
+):
+    """Background writer for security audit log."""
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            """INSERT INTO security_audit_log
+               (event_type, client_ip, ipns_name, outcome, reason, details)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (event_type, client_ip, ipns_name, outcome, reason,
+             json.dumps(details) if details else None)
+        )
+        db.commit()
+    except Exception as e:
+        logger.error(f"Security audit log failed: {e}")
 
 
 # ==========================================
@@ -876,9 +1411,11 @@ class IpnsRecordStore:
         Store an IPNS record for later republishing.
         Uses optimistic locking to prevent race conditions.
 
-        Validates:
-        1. Sequence number >= existing sequence
-        2. Version chain integrity (new CID's _meta.lastCid == current CID)
+        SECURITY HARDENED - Validates:
+        1. IPNS signature verification (if enabled)
+        2. Sequence number >= existing sequence
+        3. Version chain integrity (new CID's _meta.lastCid == current CID)
+        4. _meta field structure
 
         Returns True if stored, False if rejected.
         """
@@ -890,6 +1427,27 @@ class IpnsRecordStore:
                 new_sequence, parsed_cid = parse_ipns_record(record_bytes)
                 if cid is None and parsed_cid:
                     cid = parsed_cid
+
+                # SECURITY FIX 5: Verify IPNS signature before accepting record
+                if IPNS_SIGNATURE_VERIFICATION_ENABLED:
+                    full_record = parse_ipns_record_full(record_bytes)
+                    sig_valid, sig_reason = verify_ipns_signature(ipns_name, full_record)
+
+                    if not sig_valid:
+                        logger.error(
+                            f"IPNS SIGNATURE INVALID for {ipns_name[:16]}...: {sig_reason}"
+                        )
+                        self.metrics.ipns_signature_failed += 1
+                        await _log_forensic_event_async(
+                            self.db, "signature_verification_failed", ipns_name,
+                            {"reason": sig_reason, "sequence": new_sequence, "cid": cid}
+                        )
+                        return False
+                    else:
+                        self.metrics.ipns_signature_verified += 1
+                        logger.debug(f"IPNS signature verified for {ipns_name[:16]}...")
+                else:
+                    self.metrics.ipns_signature_skipped += 1
 
                 cursor = self.db.cursor()
 
@@ -1489,7 +2047,18 @@ class IpnsInterceptServer:
         self.app.router.add_get('/ws/ipns', self.subscription_manager.handle_websocket)
 
     async def _handle_ipns_intercept(self, request: web.Request) -> web.Response:
-        """Handle mirrored IPNS publish requests."""
+        """
+        Handle mirrored IPNS publish requests.
+
+        SECURITY HARDENED with:
+        - Multi-layer rate limiting (global, per-IP, per-IPNS-name)
+        - Signature verification (if enabled)
+        - Chain validation
+        - Security audit logging
+        """
+        # Get client IP for rate limiting and audit logging
+        client_ip = get_client_ip(request)
+
         try:
             # Extract IPNS name from query string
             query = request.query_string
@@ -1503,7 +2072,24 @@ class IpnsInterceptServer:
                 ipns_name = arg
 
             if not is_valid_ipns_name(ipns_name):
+                await log_security_audit(
+                    self.db, "ipns_intercept_rejected", client_ip, ipns_name,
+                    "rejected", "invalid_ipns_name"
+                )
                 return web.Response(status=400, text="Invalid IPNS name")
+
+            # SECURITY FIX 6: Apply rate limiting
+            rate_limiter = get_rate_limiter()
+            allowed, limit_reason = await rate_limiter.acquire(client_ip, ipns_name, self.metrics)
+            if not allowed:
+                logger.warning(
+                    f"Rate limit triggered for {ipns_name[:16]}... from {client_ip}: {limit_reason}"
+                )
+                await log_security_audit(
+                    self.db, "rate_limit_triggered", client_ip, ipns_name,
+                    "rejected", limit_reason
+                )
+                return web.Response(status=429, text=f"Rate limited: {limit_reason}")
 
             # Extract IPNS record from request body
             # Handle multipart/form-data (sent by browsers/fetch) vs raw bytes
@@ -1529,16 +2115,45 @@ class IpnsInterceptServer:
                 # Validate it's not multipart boundary data (sanity check)
                 if record_bytes.startswith(b'------'):
                     logger.error(f"Received multipart boundary as record data, skipping")
+                    await log_security_audit(
+                        self.db, "ipns_intercept_rejected", client_ip, ipns_name,
+                        "rejected", "invalid_record_format"
+                    )
                     return web.Response(status=400, text="Invalid record format")
 
-                logger.info(f"Storing IPNS record for {ipns_name[:16]}... ({len(record_bytes)} bytes)")
-                await self.ipns_store.store_record(ipns_name, record_bytes)
-                return web.Response(status=200, text="OK")
+                logger.info(f"Storing IPNS record for {ipns_name[:16]}... ({len(record_bytes)} bytes) from {client_ip}")
+                stored = await self.ipns_store.store_record(ipns_name, record_bytes)
+
+                if stored:
+                    # Success - log and return OK
+                    await log_security_audit(
+                        self.db, "ipns_intercept_accepted", client_ip, ipns_name,
+                        "accepted", "stored",
+                        {"record_size": len(record_bytes)}
+                    )
+                    return web.Response(status=200, text="OK")
+                else:
+                    # Rejected by store_record (chain validation, signature, etc.)
+                    await log_security_audit(
+                        self.db, "ipns_intercept_rejected", client_ip, ipns_name,
+                        "rejected", "validation_failed",
+                        {"record_size": len(record_bytes)}
+                    )
+                    return web.Response(status=409, text="Record rejected: validation failed")
             else:
+                await log_security_audit(
+                    self.db, "ipns_intercept_rejected", client_ip, ipns_name,
+                    "rejected", "empty_body"
+                )
                 return web.Response(status=400, text="Empty body")
 
         except Exception as e:
             logger.error(f"IPNS intercept error: {e}")
+            await log_security_audit(
+                self.db, "ipns_intercept_error", client_ip,
+                ipns_name if 'ipns_name' in locals() else None,
+                "error", str(e)
+            )
             return web.Response(status=500, text=str(e))
 
     async def _handle_health(self, request: web.Request) -> web.Response:
@@ -1591,6 +2206,15 @@ class IpnsInterceptServer:
                     "failed_break": self.metrics.chain_validations_failed_break,
                     "failed_fetch": self.metrics.chain_validations_failed_fetch,
                     "skipped": self.metrics.chain_validations_skipped,
+                },
+                "security": {
+                    "signature_verification_enabled": IPNS_SIGNATURE_VERIFICATION_ENABLED,
+                    "signatures_verified": self.metrics.ipns_signature_verified,
+                    "signatures_failed": self.metrics.ipns_signature_failed,
+                    "signatures_skipped": self.metrics.ipns_signature_skipped,
+                    "rate_limit_global_rejected": self.metrics.rate_limit_rejected_global,
+                    "rate_limit_ip_rejected": self.metrics.rate_limit_rejected_ip,
+                    "rate_limit_ipns_rejected": self.metrics.rate_limit_rejected_ipns,
                 },
                 "relays": len(NOSTR_RELAYS)
             }

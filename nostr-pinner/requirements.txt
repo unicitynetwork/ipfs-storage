@@ -14,3 +14,19 @@ python-dotenv>=1.0.0,<2.0
 
 # Nostr event signing (requires libsecp256k1-dev)
 secp256k1>=0.14.0
+
+# ==========================================
+# Security Hardening Dependencies
+# ==========================================
+
+# IPNS signature verification (Ed25519)
+# Optional - service works without it but signature verification will be disabled
+pynacl>=1.5.0,<2.0
+
+# Base58 decoding for libp2p peer IDs
+# Optional - required for extracting public keys from peer IDs
+base58>=2.1.0,<3.0
+
+# Async rate limiting
+# Optional - service works without it but rate limiting will be disabled
+aiolimiter>=1.1.0,<2.0
