@@ -516,6 +516,7 @@ async def validate_version_chain(
     current_cid: Optional[str],
     new_sequence: int,
     current_sequence: int,
+    current_version: int,
     db: sqlite3.Connection,
     metrics: Metrics
 ) -> ChainValidationResult:
@@ -523,9 +524,9 @@ async def validate_version_chain(
     Validate that new CID maintains version chain integrity.
 
     Rules:
-    1. First record (no current_cid): Accept, lastCid should be null
+    1. First record (no current_cid): Accept, lastCid should be null, version should be 1
     2. Same CID (republish): Accept
-    3. New CID: Must have _meta.lastCid == current_cid
+    3. New CID: Must have _meta.lastCid == current_cid AND _meta.version == current_version + 1
 
     Escape hatches:
     - Sequence jump >5: Bypasses chain validation (indicates multi-device conflict)
@@ -637,6 +638,32 @@ async def validate_version_chain(
 
         # In strict mode: reject the record
         return ChainValidationResult(valid=False, reason="chain_break", last_cid=last_cid)
+
+    # Validate version number: new version must be exactly current_version + 1
+    expected_version = current_version + 1
+    if version != expected_version:
+        logger.error(
+            f"VERSION MISMATCH for {ipns_name[:16]}...\n"
+            f"  Current version:  {current_version}\n"
+            f"  Expected version: {expected_version}\n"
+            f"  Actual version:   {version}\n"
+            f"  Version must increment by exactly 1!"
+        )
+        _log_chain_violation(
+            db, ipns_name, "version_mismatch",
+            current_cid, new_cid, new_sequence, str(expected_version), str(version)
+        )
+        metrics.chain_validations_failed_break += 1
+
+        # In log_only mode: accept the record but log the violation
+        if CHAIN_VALIDATION_MODE == "log_only":
+            logger.warning(
+                f"Version mismatch accepted in log_only mode for {ipns_name[:16]}..."
+            )
+            return ChainValidationResult(valid=True, reason="version_mismatch_logged", last_cid=last_cid, version=version)
+
+        # In strict mode: reject the record
+        return ChainValidationResult(valid=False, reason="version_mismatch", last_cid=last_cid, version=version)
 
     logger.info(
         f"CHAIN VALID: {ipns_name[:16]}... seq={new_sequence} v={version}"
@@ -875,6 +902,7 @@ class IpnsRecordStore:
 
                 current_cid = row['cid'] if row else None
                 existing_sequence = row['sequence'] if row else 0
+                current_version = row['version'] if row and row['version'] else 0
                 db_lock_version = row['lock_version'] if row and row['lock_version'] else 0
 
                 # Sequence validation: ALWAYS reject lower or equal sequences
@@ -905,11 +933,12 @@ class IpnsRecordStore:
                     )
                     return False
 
-                # Chain validation (if we have a CID to validate)
+                # Chain and version validation (if we have a CID to validate)
                 if cid:
                     validation = await validate_version_chain(
                         ipns_name, cid, current_cid,
                         new_sequence, existing_sequence,
+                        current_version,
                         self.db, self.metrics
                     )
 
