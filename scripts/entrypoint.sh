@@ -38,6 +38,11 @@ handle_signal() {
         fi
     fi
 
+    # Stop the TLS alias proxy
+    if [ -n "$ALIAS_PROXY_PID" ] && kill -0 "$ALIAS_PROXY_PID" 2>/dev/null; then
+        kill "$ALIAS_PROXY_PID" 2>/dev/null || true
+    fi
+
     # Forward signal to supervisord (it will stop all managed processes)
     if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
         echo "[entrypoint] Forwarding $signal to supervisord (PID $SUPERVISOR_PID)..."
@@ -220,6 +225,33 @@ SUPERVISOR_PID=""
 /usr/bin/supervisord -c /etc/supervisord.conf &
 SUPERVISOR_PID=$!
 echo "[entrypoint] Supervisord started (PID $SUPERVISOR_PID)"
+
+# Step 7b: Start TLS alias proxy after supervisord (needs nginx on 443 to be ready)
+ALIAS_PROXY_PID=""
+if [ -f /tmp/.ssl-alias-proxy.pid ]; then
+    # ssl-setup started the proxy too early (before nginx). Restart it now.
+    old_pid=$(cat /tmp/.ssl-alias-proxy.pid 2>/dev/null)
+    kill "$old_pid" 2>/dev/null || true
+    sleep 2
+    echo "[entrypoint] Restarting TLS alias proxy (waiting for nginx)..."
+    # Wait for nginx to be ready on port 443
+    for _i in $(seq 1 30); do
+        if nc -z localhost 443 2>/dev/null; then break; fi
+        sleep 2
+    done
+    python3 /usr/local/bin/ssl-alias-proxy &
+    ALIAS_PROXY_PID=$!
+    echo "[entrypoint] TLS alias proxy restarted (PID $ALIAS_PROXY_PID)"
+elif [ -n "${SSL_DOMAIN_ALIASES:-}" ] && [ -f /tmp/.ssl-env ]; then
+    # Aliases configured but proxy wasn't started by ssl-setup (e.g., SSL_REQUIRED=false fallback)
+    for _i in $(seq 1 30); do
+        if nc -z localhost 443 2>/dev/null; then break; fi
+        sleep 2
+    done
+    python3 /usr/local/bin/ssl-alias-proxy &
+    ALIAS_PROXY_PID=$!
+    echo "[entrypoint] TLS alias proxy started (PID $ALIAS_PROXY_PID)"
+fi
 
 # Step 8: Watch for SSL renewal restart marker and supervisord exit
 # ssl-renew touches /tmp/.ssl-renewal-restart when certs are renewed;
