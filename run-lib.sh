@@ -117,6 +117,7 @@ validate_port() {
 : "${SSL_TEST_MODE:=}"
 : "${SSL_HTTPS_PORT:=443}"
 : "${APP_HTTP_PORT:=0}"
+: "${SSL_DOMAIN_ALIASES:=}"
 : "${EXTRA_PORTS:=}"
 : "${HAPROXY_HOST:=haproxy}"
 : "${HAPROXY_API_PORT:=8404}"
@@ -140,6 +141,7 @@ _ssl_parse_arg() {
         --no-ssl)         SSL_DOMAIN="";          return 1 ;;
         --ssl-https-port) require_arg "$1" "${2:-}"; SSL_HTTPS_PORT="$2";   return 2 ;;
         --app-http-port)  require_arg "$1" "${2:-}"; APP_HTTP_PORT="$2";    return 2 ;;
+        --domain-aliases) require_arg "$1" "${2:-}"; SSL_DOMAIN_ALIASES="$2"; return 2 ;;
         --extra-ports)    require_arg "$1" "${2:-}"; EXTRA_PORTS="$2";      return 2 ;;
         --haproxy-host)   require_arg "$1" "${2:-}"; HAPROXY_HOST="$2";     return 2 ;;
         --haproxy-net)    require_arg "$1" "${2:-}"; HAPROXY_NET="$2";      return 2 ;;
@@ -159,15 +161,19 @@ _ssl_env_args() {
         echo "-e SSL_REQUIRED=$SSL_REQUIRED"
         echo "-e SSL_HTTPS_PORT=$SSL_HTTPS_PORT"
         echo "-e APP_HTTP_PORT=$APP_HTTP_PORT"
-        [ -n "$SSL_ADMIN_EMAIL" ] && echo "-e SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL"
-        [ -n "$SSL_STAGING" ]     && echo "-e SSL_STAGING=$SSL_STAGING"
-        [ -n "$SSL_TEST_MODE" ]   && echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"
+        if [ -n "$SSL_ADMIN_EMAIL" ]; then echo "-e SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL"; fi
+        if [ -n "$SSL_DOMAIN_ALIASES" ]; then
+            echo "-e SSL_DOMAIN_ALIASES=$SSL_DOMAIN_ALIASES"
+            echo "-e SSL_ALIAS_PROXY_PORT=${SSL_ALIAS_PROXY_PORT:-8444}"
+        fi
+        if [ -n "$SSL_STAGING" ]; then echo "-e SSL_STAGING=$SSL_STAGING"; fi
+        if [ -n "$SSL_TEST_MODE" ]; then echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"; fi
     fi
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         echo "-e HAPROXY_HOST=$HAPROXY_HOST"
         echo "-e HAPROXY_API_PORT=$HAPROXY_API_PORT"
-        [ -n "$HAPROXY_API_KEY" ] && echo "-e HAPROXY_API_KEY=$HAPROXY_API_KEY"
-        [ -n "$EXTRA_PORTS" ]     && echo "-e EXTRA_PORTS=$EXTRA_PORTS"
+        if [ -n "$HAPROXY_API_KEY" ]; then echo "-e HAPROXY_API_KEY=$HAPROXY_API_KEY"; fi
+        if [ -n "$EXTRA_PORTS" ]; then echo "-e EXTRA_PORTS=$EXTRA_PORTS"; fi
     fi
 }
 
@@ -176,12 +182,12 @@ _ssl_port_args() {
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         return  # HAProxy owns all ports
     fi
-    [ -n "$SSL_DOMAIN" ] && echo "-p 80:80"
+    if [ -n "$SSL_DOMAIN" ]; then echo "-p 80:80"; fi
 }
 
 # ─── Setup Docker networks ───────────────────────────────────────────────────
 _ssl_setup_networks() {
-    [ -n "${APP_NET:-}" ] && { docker network inspect "$APP_NET" >/dev/null 2>&1 || docker network create "$APP_NET"; }
+    if [ -n "${APP_NET:-}" ]; then docker network inspect "$APP_NET" >/dev/null 2>&1 || docker network create "$APP_NET"; fi
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         docker network inspect "$HAPROXY_NET" >/dev/null 2>&1 || docker network create "$HAPROXY_NET"
     fi
@@ -306,6 +312,7 @@ _ssl_print_help() {
     cat <<'HELP'
 SSL Configuration:
   --domain <domain>        Domain for automatic SSL (certbot)
+  --domain-aliases <csv>   Comma-separated alias domains (multi-domain SSL)
   --ssl-email <email>      Email for Let's Encrypt registration
   --ssl-staging            Use Let's Encrypt staging (test certs)
   --ssl-test-mode          Self-signed cert for dev/CI
@@ -358,6 +365,18 @@ ssl_manager_run() {
     if [ -n "$SSL_DOMAIN" ] && ! printf '%s' "$SSL_DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
         printf 'ERROR: Invalid domain: %s\n' "$SSL_DOMAIN" >&2; exit 1
     fi
+    if [ -n "$SSL_DOMAIN_ALIASES" ]; then
+        if [ -z "$SSL_DOMAIN" ]; then
+            printf 'ERROR: --domain-aliases requires --domain\n' >&2; exit 1
+        fi
+        IFS=',' read -ra _check_aliases <<< "$SSL_DOMAIN_ALIASES"
+        for _ca in "${_check_aliases[@]}"; do
+            _ca=$(echo "$_ca" | xargs)
+            if [ -n "$_ca" ] && ! printf '%s' "$_ca" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
+                printf 'ERROR: Invalid alias domain: %s\n' "$_ca" >&2; exit 1
+            fi
+        done
+    fi
     type app_validate &>/dev/null && app_validate
 
     # Print config
@@ -366,6 +385,7 @@ ssl_manager_run() {
     echo "  Image:      $IMAGE_NAME"
     echo "  Container:  $CONTAINER_NAME"
     [ -n "$SSL_DOMAIN" ] && echo "  SSL Domain: $SSL_DOMAIN" || echo "  SSL:        disabled"
+    if [ -n "$SSL_DOMAIN_ALIASES" ]; then echo "  Aliases:    $SSL_DOMAIN_ALIASES"; fi
     [ -n "$SSL_DOMAIN" ] && [ -n "$SSL_ADMIN_EMAIL" ] && echo "  SSL Email:  $SSL_ADMIN_EMAIL"
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         echo "  HAProxy:    $HAPROXY_HOST (via $HAPROXY_NET)"
@@ -404,6 +424,14 @@ ssl_manager_run() {
             check_fail "SSL port $SSL_CHECK_PORT not listening"
         fi
         _ssl_check_cert "$CONTAINER_NAME" "$SSL_DOMAIN"
+        # Check alias certs
+        if [ -n "${SSL_DOMAIN_ALIASES:-}" ]; then
+            IFS=',' read -ra _hc_aliases <<< "$SSL_DOMAIN_ALIASES"
+            for _hca in "${_hc_aliases[@]}"; do
+                _hca=$(echo "$_hca" | xargs)
+                if [ -n "$_hca" ]; then _ssl_check_cert "$CONTAINER_NAME" "$_hca"; fi
+            done
+        fi
     fi
 
     # App-specific functional checks
