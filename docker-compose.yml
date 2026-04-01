@@ -1,6 +1,10 @@
 # IPFS Storage Service (Single Container with Nostr Pinner)
-# Usage:
-#   SSL_CERT=/path/to/fullchain.pem SSL_KEY=/path/to/privkey.pem DOMAIN=example.com docker-compose up -d
+#
+# For production with HAProxy + auto SSL, use run-ipfs.sh instead:
+#   ./run-ipfs.sh --domain ipfs.example.com --ssl-email admin@example.com
+#
+# This docker-compose.yml is for development/testing without HAProxy:
+#   docker-compose up -d
 
 services:
   # Main IPFS container with nginx WSS proxy and integrated nostr-pinner
@@ -9,24 +13,33 @@ services:
     image: ipfs-storage:latest
     container_name: ipfs-kubo
     restart: always
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - ipfs-data:/data/ipfs
-      # SSL certificates - must be provided via environment variables
-      - ${SSL_CERT:?SSL_CERT is required}:/etc/ssl/certs/fullchain.pem:ro
-      - ${SSL_KEY:?SSL_KEY is required}:/etc/ssl/private/privkey.pem:ro
+      - letsencrypt-data:/etc/letsencrypt
       # Optional: Initial pin list (only needed on first run, pins persist in volume)
       - ${PIN_LIST:-/dev/null}:/data/pin-list.txt:ro
     ports:
       - "${PORT_SWARM:-4001}:4001/tcp"      # Swarm TCP
       - "${PORT_SWARM:-4001}:4001/udp"      # Swarm UDP/QUIC
       - "${PORT_WSS:-4003}:4003"            # WSS (TLS-terminated)
-      - "${PORT_HTTPS:-443}:443"            # HTTPS Gateway (set empty to disable)
-      - "${PORT_HTTP:-9080}:8080"           # HTTP Gateway
+      - "${PORT_HTTPS:-443}:443"            # HTTPS Gateway
+      - "${PORT_HTTP:-9080}:9080"           # HTTP Gateway (via ssl-manager proxy)
+      - "80:80"                             # HTTP (ACME challenges + ssl-manager proxy)
       # Note: 5001 (API) is NOT exposed externally for security
     environment:
+      # SSL configuration (ssl-manager)
+      - SSL_DOMAIN=${SSL_DOMAIN:-}
+      - SSL_ADMIN_EMAIL=${SSL_ADMIN_EMAIL:-}
+      - SSL_REQUIRED=${SSL_REQUIRED:-false}
+      - SSL_TEST_MODE=${SSL_TEST_MODE:-true}
+      - SSL_HTTPS_PORT=${SSL_HTTPS_PORT:-443}
+      - APP_HTTP_PORT=${APP_HTTP_PORT:-9080}
       # IPFS configuration
-      - DOMAIN=${DOMAIN:?DOMAIN is required}
-      - DEV_MODE=${DEV_MODE:-false}
+      - DOMAIN=${DOMAIN:-localhost}
       - IPFS_PROFILE=${IPFS_PROFILE:-server}
       - IPFS_LOGGING=${IPFS_LOGGING:-info}
       # Nostr pinner configuration (integrated, Unicity relays)
@@ -43,7 +56,7 @@ services:
       - NOSTR_PRIVATE_KEY=${NOSTR_PRIVATE_KEY:-}
       - ANNOUNCE_INTERVAL=${ANNOUNCE_INTERVAL:-0}
       - ANNOUNCE_PROBABILITY=${ANNOUNCE_PROBABILITY:-0.000277778}
-      # IPNS staleness and chain validation configuration (critical bug fixes)
+      # IPNS staleness and chain validation configuration
       - STALE_THRESHOLD_SECONDS=${STALE_THRESHOLD_SECONDS:-15}
       - CHAIN_VALIDATION_MODE=${CHAIN_VALIDATION_MODE:-strict}
       - CID_FETCH_TIMEOUT=${CID_FETCH_TIMEOUT:-3}
@@ -57,10 +70,10 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 120s
 
 volumes:
   ipfs-data:
     name: ipfs-data
-    # Use external: true if you have an existing volume
-    # external: true
+  letsencrypt-data:
+    name: letsencrypt-data

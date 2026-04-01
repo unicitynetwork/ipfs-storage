@@ -1,20 +1,18 @@
 # IPFS Storage Service with WSS Support
-# Debian-based with IPFS Kubo, nginx (TLS termination), and supervisord
+# Based on ssl-manager for automatic SSL certificate management and HAProxy integration
 
-FROM debian:bookworm-slim
+FROM ghcr.io/unicitynetwork/ssl-manager:latest
 
-# Install dependencies (including Python for nostr-pinner)
+# ssl-manager is based on debian:trixie-slim and already includes:
+#   certbot, openssl, curl, jq, netcat-openbsd, python3, procps, ca-certificates
+#
+# IPFS-specific dependencies:
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    curl \
-    ca-certificates \
+    tini \
     nginx \
     libnginx-mod-stream \
     supervisor \
     gettext-base \
-    openssl \
-    procps \
-    python3 \
     python3-pip \
     python3-dev \
     # Build dependencies for secp256k1 Python package
@@ -61,8 +59,10 @@ COPY config/nginx.conf.template /etc/nginx/nginx.conf.template
 COPY scripts/ /usr/local/bin/
 RUN chmod 755 /usr/local/bin/*.sh
 
-# Volumes
-VOLUME /data/ipfs
+# Volumes — declared for documentation; explicit -v mounts are always used
+# Do NOT use VOLUME ["/data/ipfs"] — it creates anonymous volumes that silently
+# mask mount failures, risking data loss of 690GB+ of pinned IPFS content.
+VOLUME ["/etc/letsencrypt"]
 
 # Ports
 # 4001 - IPFS Swarm (TCP/UDP)
@@ -72,19 +72,17 @@ VOLUME /data/ipfs
 # 8080 - IPFS Gateway (internal)
 # 443  - HTTPS Gateway (via nginx)
 # 9080 - HTTP Gateway (exposed)
+# Port 80 is already EXPOSE'd by ssl-manager base image
 EXPOSE 4001/tcp 4001/udp 4003 443 9080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD /usr/local/bin/healthcheck.sh
 
 # Environment variables
 ENV DOMAIN=localhost \
-    SSL_CERT_PATH=/etc/ssl/certs/fullchain.pem \
-    SSL_KEY_PATH=/etc/ssl/private/privkey.pem \
     IPFS_PROFILE=server \
     IPFS_LOGGING=info \
-    DEV_MODE=false \
     # Nostr pinner configuration (Unicity relays)
     NOSTR_RELAYS="wss://nostr-relay.testnet.unicity.network,ws://unicity-nostr-relay-20250927-alb-1919039002.me-central-1.elb.amazonaws.com:8080" \
     IPFS_API_URL="http://127.0.0.1:5001" \
@@ -101,4 +99,4 @@ ENV DOMAIN=localhost \
     ANNOUNCE_INTERVAL="0" \
     ANNOUNCE_PROBABILITY="0.000277778"
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
