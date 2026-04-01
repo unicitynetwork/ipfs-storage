@@ -37,3 +37,4 @@ logs/
 *.key
 *.crt
 *.csr
+.claude

@@ -42,13 +42,26 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config Addresses.API /ip4/
 # Bind Gateway to all interfaces (within container)
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config Addresses.Gateway /ip4/0.0.0.0/tcp/8080"
 
-# Enable relay for browser clients
+# Enable relay client and service with resource caps
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayClient.Enabled true"
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayService.Enabled true"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayService '{
+  \"Enabled\": true,
+  \"ConnectionDurationLimit\": \"2m0s\",
+  \"ConnectionDataLimit\": 131072,
+  \"ReservationTTL\": \"60m\",
+  \"MaxReservations\": 64,
+  \"MaxCircuits\": 16,
+  \"BufferSize\": 4096,
+  \"MaxReservationsPerIP\": 8,
+  \"MaxReservationsPerASN\": 32
+}'"
 
-# Set connection limits for server profile
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.LowWater 100"
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.HighWater 400"
+# Connection manager: cap connections with graceful trimming
+# LowWater/HighWater ratio kept gentle (75%) to avoid connection storm churn
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.Type '\"basic\"'"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.LowWater 96"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.HighWater 128"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.GracePeriod '\"2m\"'"
 
 # Add Unicity bootstrap peers
 echo "[IPFS] Adding Unicity bootstrap peers..."
@@ -57,14 +70,44 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicit
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4001/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4003/wss/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
 
+# === RESOURCE MANAGER: cap system-wide resources ===
+# Kubo 0.19+ removed Swarm.ResourceMgr.Limits — use libp2p-resource-limit-overrides.json instead
+echo "[IPFS] Configuring resource manager limits..."
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ResourceMgr.Enabled true"
+
+cat > /data/ipfs/libp2p-resource-limit-overrides.json << 'RESLIMITS'
+{
+  "System": {
+    "Conns": 512,
+    "ConnsInbound": 256,
+    "ConnsOutbound": 256,
+    "Streams": 2048,
+    "StreamsInbound": 1024,
+    "StreamsOutbound": 1024,
+    "FD": 4096,
+    "Memory": 1610612736
+  }
+}
+RESLIMITS
+chown ipfs:ipfs /data/ipfs/libp2p-resource-limit-overrides.json
+
+# === REPROVIDER: use "roots" strategy ===
+# "roots" announces root blocks of all DAGs (not every sub-block), keeping child blocks
+# discoverable via DAG traversal while reducing DHT announcement volume vs "all"
+# Using Provide.* (Reprovider.* deprecated since Kubo 0.38)
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Provide.Strategy '\"roots\"'"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Provide.DHT.Interval '\"22h\"'"
+
 # === PERFORMANCE OPTIMIZATIONS FOR FAST HTTP RESPONSES ===
 echo "[IPFS] Applying performance optimizations..."
 
-# Enable Accelerated DHT Client (critical for fast IPNS lookups)
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Routing.AcceleratedDHTClient true"
+# Disable AcceleratedDHTClient — it aggressively crawls the full routing table,
+# generating thousands of DNS lookups and connections. Standard DHT server mode
+# is sufficient for IPNS/CID propagation and serving the network.
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Routing.AcceleratedDHTClient false"
 
-# Increase IPNS cache size for faster repeated lookups
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Ipns.ResolveCacheSize 4096"
+# IPNS cache: 1024 balances cold-start coverage vs DHT refresh load (was 4096)
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Ipns.ResolveCacheSize 1024"
 
 # Enable gateway routing API exposure
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Gateway.ExposeRoutingAPI true"
