@@ -38,11 +38,6 @@ handle_signal() {
         fi
     fi
 
-    # Stop the TLS alias proxy
-    if [ -n "$ALIAS_PROXY_PID" ] && kill -0 "$ALIAS_PROXY_PID" 2>/dev/null; then
-        kill "$ALIAS_PROXY_PID" 2>/dev/null || true
-    fi
-
     # Forward signal to supervisord (it will stop all managed processes)
     if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
         echo "[entrypoint] Forwarding $signal to supervisord (PID $SUPERVISOR_PID)..."
@@ -124,6 +119,9 @@ configure_nginx() {
         < /etc/nginx/nginx.conf.template \
         > /etc/nginx/nginx.conf
 
+    # Add alias domain server blocks if SSL_DOMAIN_ALIASES is set
+    add_nginx_alias_blocks
+
     if ! nginx -t 2>/dev/null; then
         echo "[entrypoint] ERROR: nginx configuration is invalid"
         nginx -t
@@ -131,6 +129,103 @@ configure_nginx() {
     fi
 
     echo "[entrypoint] nginx configuration ready"
+}
+
+# ---------------------------------------------------------------------------
+# Generate nginx server blocks for domain aliases
+# ---------------------------------------------------------------------------
+add_nginx_alias_blocks() {
+    if [ -z "${SSL_DOMAIN_ALIASES:-}" ]; then return; fi
+
+    echo "[entrypoint] Adding nginx server blocks for domain aliases..."
+
+    # Find the last closing brace of the http{} block
+    local last_brace
+    last_brace=$(grep -n "^}" /etc/nginx/nginx.conf | tail -1 | cut -d: -f1)
+    if [ -z "$last_brace" ]; then
+        echo "[entrypoint] WARNING: Could not find http{} closing brace, skipping aliases"
+        return
+    fi
+
+    # Build alias server blocks
+    local alias_conf="/tmp/nginx-alias-blocks.conf"
+    : > "$alias_conf"
+
+    local _alias
+    IFS=',' read -ra _aliases <<< "$SSL_DOMAIN_ALIASES"
+    for _alias in "${_aliases[@]}"; do
+        _alias=$(echo "$_alias" | xargs)
+        if [ -z "$_alias" ]; then continue; fi
+
+        local _cert="/etc/letsencrypt/live/${_alias}/fullchain.pem"
+        local _key="/etc/letsencrypt/live/${_alias}/privkey.pem"
+        if [ ! -f "$_cert" ] || [ ! -f "$_key" ]; then
+            echo "[entrypoint] WARNING: No cert for alias $_alias, skipping"
+            continue
+        fi
+
+        echo "[entrypoint] Adding nginx block for alias: $_alias"
+        cat >> "$alias_conf" << ALIASEOF
+
+    # Alias domain: ${_alias}
+    server {
+        listen 443 ssl;
+        http2 on;
+        server_name ${_alias};
+        ssl_certificate ${_cert};
+        ssl_certificate_key ${_key};
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+
+        location /health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+
+        location / {
+            proxy_pass http://ipfs_gateway;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            client_max_body_size 100M;
+            proxy_read_timeout 300s;
+        }
+
+        location /api/v0/ {
+            proxy_pass http://127.0.0.1:5001;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_read_timeout 120s;
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        location /ws/ipns {
+            proxy_pass http://sidecar/ws/ipns;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_read_timeout 86400;
+        }
+    }
+ALIASEOF
+    done
+
+    # Insert alias blocks before the last closing brace of http{}
+    if [ -s "$alias_conf" ]; then
+        head -n $((last_brace - 1)) /etc/nginx/nginx.conf > /tmp/nginx-with-aliases.conf
+        cat "$alias_conf" >> /tmp/nginx-with-aliases.conf
+        echo "}" >> /tmp/nginx-with-aliases.conf
+        cp /tmp/nginx-with-aliases.conf /etc/nginx/nginx.conf
+        rm -f /tmp/nginx-with-aliases.conf
+    fi
+    rm -f "$alias_conf"
 }
 
 # ===========================================================================
@@ -204,7 +299,7 @@ fi
 # Step 4: Initialize IPFS
 init_ipfs
 
-# Step 5: Configure nginx
+# Step 5: Configure nginx (includes alias server blocks if SSL_DOMAIN_ALIASES is set)
 configure_nginx
 
 # Step 6: Display connection info
@@ -225,33 +320,6 @@ SUPERVISOR_PID=""
 /usr/bin/supervisord -c /etc/supervisord.conf &
 SUPERVISOR_PID=$!
 echo "[entrypoint] Supervisord started (PID $SUPERVISOR_PID)"
-
-# Step 7b: Start TLS alias proxy after supervisord (needs nginx on 443 to be ready)
-ALIAS_PROXY_PID=""
-if [ -f /tmp/.ssl-alias-proxy.pid ]; then
-    # ssl-setup started the proxy too early (before nginx). Restart it now.
-    old_pid=$(cat /tmp/.ssl-alias-proxy.pid 2>/dev/null)
-    kill "$old_pid" 2>/dev/null || true
-    sleep 2
-    echo "[entrypoint] Restarting TLS alias proxy (waiting for nginx)..."
-    # Wait for nginx to be ready on port 443
-    for _i in $(seq 1 30); do
-        if nc -z localhost 443 2>/dev/null; then break; fi
-        sleep 2
-    done
-    python3 /usr/local/bin/ssl-alias-proxy &
-    ALIAS_PROXY_PID=$!
-    echo "[entrypoint] TLS alias proxy restarted (PID $ALIAS_PROXY_PID)"
-elif [ -n "${SSL_DOMAIN_ALIASES:-}" ] && [ -f /tmp/.ssl-env ]; then
-    # Aliases configured but proxy wasn't started by ssl-setup (e.g., SSL_REQUIRED=false fallback)
-    for _i in $(seq 1 30); do
-        if nc -z localhost 443 2>/dev/null; then break; fi
-        sleep 2
-    done
-    python3 /usr/local/bin/ssl-alias-proxy &
-    ALIAS_PROXY_PID=$!
-    echo "[entrypoint] TLS alias proxy started (PID $ALIAS_PROXY_PID)"
-fi
 
 # Step 8: Watch for SSL renewal restart marker and supervisord exit
 # ssl-renew touches /tmp/.ssl-renewal-restart when certs are renewed;
