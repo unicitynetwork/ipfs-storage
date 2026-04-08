@@ -164,7 +164,6 @@ _ssl_env_args() {
         if [ -n "$SSL_ADMIN_EMAIL" ]; then echo "-e SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL"; fi
         if [ -n "$SSL_DOMAIN_ALIASES" ]; then
             echo "-e SSL_DOMAIN_ALIASES=$SSL_DOMAIN_ALIASES"
-            echo "-e SSL_ALIAS_PROXY_PORT=${SSL_ALIAS_PROXY_PORT:-8444}"
         fi
         if [ -n "$SSL_STAGING" ]; then echo "-e SSL_STAGING=$SSL_STAGING"; fi
         if [ -n "$SSL_TEST_MODE" ]; then echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"; fi
