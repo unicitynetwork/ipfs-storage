@@ -182,6 +182,84 @@ The Nostr pinner is integrated into the container and listens for pin requests o
 | `ANNOUNCE_PROBABILITY` | 0.000277778 | Probability per second (~1/3600 = once per hour avg) |
 | `NOSTR_PRIVATE_KEY` | (generated) | Hex private key for signing announcements (persists identity) |
 
+### Instant-Pin Cache (Write-Through)
+
+The sidecar holds CAR/block bytes durably between submit and Kubo
+blockstore registration. This closes the "publish-then-immediately-read"
+window where Kubo has accepted a CAR but hasn't yet made it retrievable
+by CID — the dominant source of cross-device IPFS races for the
+sphere-sdk integration tests (see issue
+[#6](https://github.com/unicitynetwork/ipfs-storage/issues/6)).
+
+#### How it works
+
+1. A client POSTs raw bytes to `POST /sidecar/submit?cid=<cid>`. The
+   sidecar writes them atomically to `SIDECAR_CACHE_DIR/<cid[:2]>/<cid>`
+   and records a `pending` row in the `instant_pin_cache` SQLite table.
+   The 200 response is returned **immediately** — no Kubo round-trip on
+   the write path.
+2. Reads via `/api/v0/block/get?arg=<cid>` and `/ipfs/<cid>` are routed
+   to the sidecar first by nginx (with a short timeout). On cache hit
+   the bytes are served from disk; on miss / non-raw-bytes Accept,
+   nginx falls back to the Kubo gateway transparently.
+3. A background reconciler (every `SIDECAR_CACHE_RECONCILE_INTERVAL`
+   seconds) tries to push each `pending` blob to Kubo via
+   `/api/v0/block/put` + `/api/v0/pin/add`. Once Kubo confirms via
+   `/api/v0/block/stat`, the row flips to `in-kubo` and the disk blob
+   is deleted (SQLite metadata kept for audit).
+4. The cache is bounded by total bytes AND entry count. LRU eviction
+   targets only `in-kubo` rows; **pending rows are never silently
+   evicted** because the publisher believes they're durable. When full
+   of unconfirmed entries, new submits get HTTP `503 Service
+   Unavailable` so the writer back-pressures.
+
+#### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIDECAR_CACHE_ENABLED` | `true` | Kill switch — set to `false` to skip schema migration and disable all `/sidecar/*` endpoints |
+| `SIDECAR_CACHE_DIR` | `/data/ipfs/sidecar-cache` | Directory for blob bytes (auto-created) |
+| `SIDECAR_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Total cache budget across pending + in-kubo rows |
+| `SIDECAR_CACHE_MAX_ENTRIES` | `10000` | Entry cap (whichever cap hits first) |
+| `SIDECAR_CACHE_MAX_BLOB_BYTES` | `33554432` (32 MiB) | Per-submission size limit; oversize returns HTTP 413 |
+| `SIDECAR_CACHE_RECONCILE_INTERVAL` | `5` | Seconds between reconciler iterations |
+| `SIDECAR_CACHE_PROMOTION_TIMEOUT` | `86400` (24 h) | Pending rows older than this trigger operator WARN logs (never silently aged out) |
+| `SIDECAR_CACHE_KUBO_TIMEOUT` | `30` | Per-call timeout for the reconciler's Kubo requests |
+
+#### Scope and limitations
+
+- The cache works at the **block** granularity: the bytes you POST under
+  a CID are the bytes the cache serves back for that CID. For payloads
+  uploaded via `/api/v0/add?cid-version=1` that fit in a single Kubo
+  block (default chunk size 256 KiB, which covers all current
+  sphere-sdk UXF fragments), the gateway-fetched bytes
+  (`/ipfs/<cid>` with `Accept: application/octet-stream`) and the
+  sidecar-cached bytes match exactly. For multi-block UnixFS files the
+  sidecar cannot reconstruct the dag traversal — clients that need
+  reads on multi-block files must fall through to the Kubo gateway.
+- The cache is a **window-closer**, not a replacement for Kubo: the
+  publisher's primary write path (e.g., `/api/v0/add`) should continue
+  to be the source of truth. The sidecar `/sidecar/submit` call is an
+  additive instant-availability hint.
+
+#### Operator endpoints
+
+- `GET /sidecar/cache-stats` — JSON snapshot of pending/confirmed
+  counts, byte usage, and lifetime promotion counters.
+- `GET /metrics` — existing endpoint now includes an `instant_pin_cache`
+  object with the same data.
+
+#### Running the tests
+
+```bash
+cd nostr-pinner
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+(Run from a Python 3.12 environment; in CI we use the same Docker image
+that builds the sidecar.)
+
 ## Make Commands
 
 ```bash

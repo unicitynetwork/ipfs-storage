@@ -1,0 +1,7 @@
+# Dev-only dependencies for running unit tests on the sidecar code.
+# These are intentionally NOT in requirements.txt so the production Docker
+# image stays slim.
+-r requirements.txt
+
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<1.0
