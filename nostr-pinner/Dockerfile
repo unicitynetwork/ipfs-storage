@@ -14,8 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd -r -s /bin/false pinner
 
 # Copy application and set permissions
-COPY nostr_pinner.py .
-RUN chmod 644 nostr_pinner.py
+COPY nostr_pinner.py instant_pin_cache.py ./
+RUN chmod 644 nostr_pinner.py instant_pin_cache.py
 
 USER pinner
 

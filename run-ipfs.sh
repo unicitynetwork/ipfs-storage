@@ -87,6 +87,15 @@ app_env_args() {
     echo "-e STALE_THRESHOLD_SECONDS=$STALE_THRESHOLD_SECONDS"
     echo "-e CHAIN_VALIDATION_MODE=$CHAIN_VALIDATION_MODE"
     if [ -n "$NOSTR_PRIVATE_KEY" ]; then echo "-e NOSTR_PRIVATE_KEY=$NOSTR_PRIVATE_KEY"; fi
+    # Instant-pin cache (issue #6) - only pass overrides; defaults are in
+    # the image so empty values won't shadow them.
+    for v in SIDECAR_CACHE_ENABLED SIDECAR_CACHE_DIR SIDECAR_CACHE_MAX_BYTES \
+             SIDECAR_CACHE_MAX_ENTRIES SIDECAR_CACHE_MAX_BLOB_BYTES \
+             SIDECAR_CACHE_RECONCILE_INTERVAL SIDECAR_CACHE_PROMOTION_TIMEOUT \
+             SIDECAR_CACHE_KUBO_TIMEOUT; do
+        eval "val=\${$v:-}"
+        if [ -n "$val" ]; then echo "-e $v=$val"; fi
+    done
 }
 
 app_port_args() {

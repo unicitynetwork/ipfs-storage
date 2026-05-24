@@ -49,9 +49,10 @@ COPY nostr-pinner/requirements.txt /tmp/nostr-requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/nostr-requirements.txt && \
     rm /tmp/nostr-requirements.txt
 
-# Copy nostr-pinner script
+# Copy nostr-pinner script(s)
 COPY nostr-pinner/nostr_pinner.py /usr/local/bin/nostr_pinner.py
-RUN chmod 644 /usr/local/bin/nostr_pinner.py
+COPY nostr-pinner/instant_pin_cache.py /usr/local/bin/instant_pin_cache.py
+RUN chmod 644 /usr/local/bin/nostr_pinner.py /usr/local/bin/instant_pin_cache.py
 
 # Copy configuration files
 COPY config/supervisord.conf /etc/supervisord.conf
@@ -97,6 +98,15 @@ ENV DOMAIN=localhost \
     NODE_NAME="ipfs-node" \
     NOSTR_PRIVATE_KEY="" \
     ANNOUNCE_INTERVAL="0" \
-    ANNOUNCE_PROBABILITY="0.000277778"
+    ANNOUNCE_PROBABILITY="0.000277778" \
+    # Instant-pin write-through cache (issue #6)
+    SIDECAR_CACHE_ENABLED="true" \
+    SIDECAR_CACHE_DIR="/data/ipfs/sidecar-cache" \
+    SIDECAR_CACHE_MAX_BYTES="1073741824" \
+    SIDECAR_CACHE_MAX_ENTRIES="10000" \
+    SIDECAR_CACHE_MAX_BLOB_BYTES="33554432" \
+    SIDECAR_CACHE_RECONCILE_INTERVAL="5" \
+    SIDECAR_CACHE_PROMOTION_TIMEOUT="86400" \
+    SIDECAR_CACHE_KUBO_TIMEOUT="30"
 
 ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
