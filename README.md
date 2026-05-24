@@ -226,6 +226,22 @@ sphere-sdk integration tests (see issue
 | `SIDECAR_CACHE_PROMOTION_TIMEOUT` | `86400` (24 h) | Pending rows older than this trigger operator WARN logs (never silently aged out) |
 | `SIDECAR_CACHE_KUBO_TIMEOUT` | `30` | Per-call timeout for the reconciler's Kubo requests |
 
+#### Scope and limitations
+
+- The cache works at the **block** granularity: the bytes you POST under
+  a CID are the bytes the cache serves back for that CID. For payloads
+  uploaded via `/api/v0/add?cid-version=1` that fit in a single Kubo
+  block (default chunk size 256 KiB, which covers all current
+  sphere-sdk UXF fragments), the gateway-fetched bytes
+  (`/ipfs/<cid>` with `Accept: application/octet-stream`) and the
+  sidecar-cached bytes match exactly. For multi-block UnixFS files the
+  sidecar cannot reconstruct the dag traversal — clients that need
+  reads on multi-block files must fall through to the Kubo gateway.
+- The cache is a **window-closer**, not a replacement for Kubo: the
+  publisher's primary write path (e.g., `/api/v0/add`) should continue
+  to be the source of truth. The sidecar `/sidecar/submit` call is an
+  additive instant-availability hint.
+
 #### Operator endpoints
 
 - `GET /sidecar/cache-stats` — JSON snapshot of pending/confirmed
