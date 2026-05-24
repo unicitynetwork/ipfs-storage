@@ -99,13 +99,43 @@ http {
         add_header X-XSS-Protection "1; mode=block" always;
 
         # Cached /ipfs/ content (CID-addressed = immutable, safe to cache long-term)
+        #
+        # FAST PATH: route raw-bytes reads through the instant-pin sidecar
+        # first (issue #6). The sidecar returns 404 unless (a) it holds the
+        # CID locally AND (b) the client asked for raw bytes. nginx falls
+        # back to the Kubo gateway in all other cases, preserving Kubo's
+        # content negotiation for HTML/JSON/etc.
         location /ipfs/ {
             # CRITICAL: Disable gzip compression for content-addressed data
             # Gzipping JSON and then re-serializing breaks CID verification
             # (JSON.stringify may reorder keys -> different bytes -> different hash)
             gzip off;
 
-            proxy_pass http://ipfs_gateway;
+            # Try sidecar first. Forward the original Accept header so the
+            # sidecar can decide whether to serve raw bytes.
+            rewrite ^/ipfs/([^/?]+).*$ /sidecar/blob?cid=$1 break;
+            proxy_pass http://sidecar;
+            proxy_set_header Accept $http_accept;
+            proxy_connect_timeout 1s;
+            proxy_read_timeout 2s;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # On 404 (cache miss or not-raw Accept) or sidecar error, fall
+            # back to the Kubo gateway with its full proxy_cache behavior.
+            proxy_intercept_errors on;
+            error_page 404 500 502 503 504 = @ipfs_gateway_fallback;
+
+            add_header X-Sidecar-Cache $upstream_http_x_sidecar_cache always;
+        }
+
+        location @ipfs_gateway_fallback {
+            gzip off;
+
+            proxy_pass http://ipfs_gateway$request_uri;
             proxy_cache ipfs_cache;
             proxy_cache_valid 200 7d;
             proxy_cache_key $uri;
@@ -217,8 +247,28 @@ http {
         }
 
         # Block get endpoint for direct block retrieval (read-only, safe)
+        # FAST PATH: try the instant-pin cache (sidecar) first; on 404 fall
+        # through to Kubo so publish-then-immediately-read works without the
+        # multi-second Kubo registration window. See issue #6.
         location /api/v0/block/get {
-            proxy_pass http://127.0.0.1:5001;
+            proxy_pass http://sidecar/sidecar/blob$is_args$args;
+            proxy_connect_timeout 1s;
+            proxy_read_timeout 2s;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+
+            # On 404 (not in cache) or sidecar error, fall back to Kubo.
+            proxy_intercept_errors on;
+            error_page 404 500 502 503 504 = @block_get_fallback;
+
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        location @block_get_fallback {
+            proxy_pass http://127.0.0.1:5001/api/v0/block/get$is_args$args;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_read_timeout 60s;
@@ -226,6 +276,18 @@ http {
             proxy_pass_header Access-Control-Allow-Methods;
             proxy_pass_header Access-Control-Allow-Headers;
             proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        # Instant-pin cache submit + read endpoints (issue #6).
+        # Clients that hold the raw CAR/block bytes can POST them here to make
+        # the CID retrievable instantly, before Kubo registers it.
+        location /sidecar/ {
+            client_max_body_size 50M;
+            proxy_pass http://sidecar;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 60s;
+            proxy_send_timeout 60s;
         }
 
         # Add endpoint for direct content upload from browser

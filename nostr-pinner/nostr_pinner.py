@@ -58,6 +58,12 @@ import websockets
 from aiohttp import web
 from websockets.exceptions import ConnectionClosed
 
+from instant_pin_cache import (
+    InstantPinCache,
+    SubmitOutcome,
+    build_from_env as build_instant_pin_cache,
+)
+
 # Optional dependencies for IPNS signature verification and rate limiting
 try:
     import nacl.signing
@@ -2015,13 +2021,14 @@ class ReannounceScheduler:
 class IpnsInterceptServer:
     """HTTP server to intercept IPNS publish requests."""
 
-    def __init__(self, ipns_store: IpnsRecordStore, db: sqlite3.Connection, metrics: Metrics, port: int = HTTP_PORT, scheduler: 'ReannounceScheduler' = None):
+    def __init__(self, ipns_store: IpnsRecordStore, db: sqlite3.Connection, metrics: Metrics, port: int = HTTP_PORT, scheduler: 'ReannounceScheduler' = None, instant_pin_cache: Optional[InstantPinCache] = None):
         self.ipns_store = ipns_store
         self.db = db
         self.metrics = metrics
         self.port = port
         self.scheduler = scheduler
         self.app = web.Application()
+        self.instant_pin_cache = instant_pin_cache
 
         # Initialize subscription manager for WebSocket IPNS updates
         self.subscription_manager = IpnsSubscriptionManager()
@@ -2045,6 +2052,11 @@ class IpnsInterceptServer:
         self.app.router.add_get('/pin-status', self._handle_pin_status)
         # WebSocket endpoint for IPNS subscriptions
         self.app.router.add_get('/ws/ipns', self.subscription_manager.handle_websocket)
+        # Instant-pin write-through cache endpoints (issue #6)
+        self.app.router.add_post('/sidecar/submit', self._handle_sidecar_submit)
+        self.app.router.add_get('/sidecar/blob', self._handle_sidecar_blob)
+        self.app.router.add_post('/sidecar/blob', self._handle_sidecar_blob)
+        self.app.router.add_get('/sidecar/cache-stats', self._handle_sidecar_cache_stats)
 
     async def _handle_ipns_intercept(self, request: web.Request) -> web.Response:
         """
@@ -2218,6 +2230,9 @@ class IpnsInterceptServer:
                 },
                 "relays": len(NOSTR_RELAYS)
             }
+
+            if self.instant_pin_cache is not None:
+                metrics_data["instant_pin_cache"] = self.instant_pin_cache.stats()
 
             return web.Response(
                 status=200,
@@ -2508,6 +2523,129 @@ class IpnsInterceptServer:
                 text=json.dumps({"error": str(e)})
             )
 
+    # ---- Instant-pin cache endpoints (issue #6) ----
+
+    async def _handle_sidecar_submit(self, request: web.Request) -> web.Response:
+        """
+        Accept raw CAR/block bytes for a given CID and durably cache them on
+        the sidecar so they're retrievable by CID immediately. The reconciler
+        will push them to Kubo in the background.
+
+        Query: ?cid=<cid>
+        Body:  raw bytes (application/octet-stream)
+        """
+        if self.instant_pin_cache is None or not self.instant_pin_cache.enabled:
+            return web.Response(
+                status=503,
+                content_type='application/json',
+                text=json.dumps({"ok": False, "error": "instant_pin_cache disabled"}),
+            )
+        try:
+            cid = request.query.get('cid', '').strip()
+            if not cid or not is_valid_cid(cid):
+                return web.Response(
+                    status=400,
+                    content_type='application/json',
+                    text=json.dumps({"ok": False, "error": "missing or invalid cid"}),
+                )
+            data = await request.read()
+            if not data:
+                return web.Response(
+                    status=400,
+                    content_type='application/json',
+                    text=json.dumps({"ok": False, "error": "empty body"}),
+                )
+            result = await self.instant_pin_cache.submit(cid, data)
+            return web.Response(
+                status=result.http_status,
+                content_type='application/json',
+                text=json.dumps({
+                    "ok": result.outcome in (SubmitOutcome.ACCEPTED, SubmitOutcome.ALREADY_PRESENT, SubmitOutcome.ALREADY_CONFIRMED),
+                    "outcome": result.outcome.value,
+                    "detail": result.detail,
+                    "cid": cid,
+                    "bytes": len(data),
+                }),
+            )
+        except Exception as e:
+            logger.error(f"sidecar/submit error: {e}")
+            return web.Response(
+                status=500,
+                content_type='application/json',
+                text=json.dumps({"ok": False, "error": str(e)}),
+            )
+
+    async def _handle_sidecar_blob(self, request: web.Request) -> web.Response:
+        """
+        Return raw bytes for a CID held in the instant-pin cache. 404 if not
+        present (or if the client wants a deserialized representation) so
+        nginx can fall through to the Kubo gateway.
+
+        Query: ?cid=<cid>  (also accepts ?arg=<cid> for Kubo-API compatibility)
+        Accept policy: only serves when the client clearly wants raw bytes
+        (Accept: application/octet-stream, application/vnd.ipld.raw,
+        application/vnd.ipld.car, application/vnd.ipld.dag-cbor) or omits the
+        header. For other Accept values we 404 so the Kubo gateway can
+        deserialize.
+        """
+        if self.instant_pin_cache is None or not self.instant_pin_cache.enabled:
+            return web.Response(status=404, text='cache disabled')
+        try:
+            # Accept both `cid=` (native) and `arg=` (Kubo-style, for nginx
+            # fast-path routing of /api/v0/block/get).
+            cid = (request.query.get('cid') or request.query.get('arg') or '').strip()
+            if not cid or not is_valid_cid(cid):
+                return web.Response(status=400, text='missing or invalid cid')
+
+            accept = request.headers.get('Accept', '').lower()
+            if accept and accept != '*/*':
+                ok = (
+                    'application/octet-stream' in accept
+                    or 'application/vnd.ipld.raw' in accept
+                    or 'application/vnd.ipld.car' in accept
+                    or 'application/vnd.ipld.dag-cbor' in accept
+                )
+                if not ok:
+                    return web.Response(status=404, text='cache only serves raw bytes')
+
+            data = await self.instant_pin_cache.get(cid)
+            if data is None:
+                return web.Response(status=404, text='not in sidecar cache')
+            return web.Response(
+                status=200,
+                body=data,
+                content_type='application/octet-stream',
+                headers={
+                    'X-Sidecar-Cache': 'hit',
+                    'X-Sidecar-Cache-CID': cid,
+                    'Cache-Control': 'public, max-age=31536000, immutable',
+                },
+            )
+        except Exception as e:
+            logger.error(f"sidecar/blob error: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def _handle_sidecar_cache_stats(self, request: web.Request) -> web.Response:
+        """Cheap snapshot of cache stats for /metrics dashboards."""
+        if self.instant_pin_cache is None:
+            return web.Response(
+                status=200,
+                content_type='application/json',
+                text=json.dumps({"enabled": False}),
+            )
+        try:
+            return web.Response(
+                status=200,
+                content_type='application/json',
+                text=json.dumps(self.instant_pin_cache.stats()),
+            )
+        except Exception as e:
+            return web.Response(
+                status=500,
+                content_type='application/json',
+                text=json.dumps({"error": str(e)}),
+            )
+
     async def start(self):
         """Start the HTTP server."""
         runner = web.AppRunner(self.app)
@@ -2718,7 +2856,14 @@ async def main():
     ipns_store = IpnsRecordStore(db, metrics)
     publisher = NostrPublisher(NOSTR_RELAYS, NOSTR_PRIVATE_KEY)
     scheduler = ReannounceScheduler(db, ipns_store, publisher, metrics)
-    http_server = IpnsInterceptServer(ipns_store, db, metrics, HTTP_PORT, scheduler=scheduler)
+    # Instant-pin write-through cache (issue #6): closes the publish->read
+    # window by holding CAR/block bytes durably on the sidecar until Kubo
+    # registers them.
+    instant_pin_cache = build_instant_pin_cache(db, IPFS_API_URL)
+    http_server = IpnsInterceptServer(
+        ipns_store, db, metrics, HTTP_PORT,
+        scheduler=scheduler, instant_pin_cache=instant_pin_cache,
+    )
 
     shutdown_event = asyncio.Event()
 
@@ -2762,7 +2907,13 @@ async def main():
         name="dht-sync"
     )
 
-    logger.info(f"Service started: {len(relay_tasks)} relay(s), rate-limited queue, scheduler, DHT sync worker")
+    # Start instant-pin cache reconciler (no-op if disabled via env)
+    instant_pin_task = asyncio.create_task(
+        instant_pin_cache.run_reconciler(shutdown_event),
+        name="instant-pin-reconciler"
+    )
+
+    logger.info(f"Service started: {len(relay_tasks)} relay(s), rate-limited queue, scheduler, DHT sync worker, instant-pin reconciler")
 
     # Wait for shutdown
     await shutdown_event.wait()
@@ -2771,10 +2922,13 @@ async def main():
     logger.info("Shutting down...")
 
     # Cancel all tasks
-    for task in relay_tasks + [queue_task, scheduler_task, dht_sync_task]:
+    for task in relay_tasks + [queue_task, scheduler_task, dht_sync_task, instant_pin_task]:
         task.cancel()
 
-    await asyncio.gather(*relay_tasks, queue_task, scheduler_task, dht_sync_task, return_exceptions=True)
+    await asyncio.gather(
+        *relay_tasks, queue_task, scheduler_task, dht_sync_task, instant_pin_task,
+        return_exceptions=True,
+    )
 
     # Cleanup HTTP server
     await http_runner.cleanup()
