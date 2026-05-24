@@ -99,43 +99,18 @@ http {
         add_header X-XSS-Protection "1; mode=block" always;
 
         # Cached /ipfs/ content (CID-addressed = immutable, safe to cache long-term)
-        #
-        # FAST PATH: route raw-bytes reads through the instant-pin sidecar
-        # first (issue #6). The sidecar returns 404 unless (a) it holds the
-        # CID locally AND (b) the client asked for raw bytes. nginx falls
-        # back to the Kubo gateway in all other cases, preserving Kubo's
-        # content negotiation for HTML/JSON/etc.
+        # NOTE: a previous revision (issue #6) added a sidecar fast-path
+        # here. Reverted along with the /api/v0/block/get fast-path because
+        # the sidecar handler 404s without draining request bodies, which
+        # can hang upstream connections for POST clients. Explicit clients
+        # can still hit /sidecar/blob directly for the fast path.
         location /ipfs/ {
             # CRITICAL: Disable gzip compression for content-addressed data
             # Gzipping JSON and then re-serializing breaks CID verification
             # (JSON.stringify may reorder keys -> different bytes -> different hash)
             gzip off;
 
-            # Try sidecar first. Forward the original Accept header so the
-            # sidecar can decide whether to serve raw bytes.
-            rewrite ^/ipfs/([^/?]+).*$ /sidecar/blob?cid=$1 break;
-            proxy_pass http://sidecar;
-            proxy_set_header Accept $http_accept;
-            proxy_connect_timeout 1s;
-            proxy_read_timeout 2s;
-
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-
-            # On 404 (cache miss or not-raw Accept) or sidecar error, fall
-            # back to the Kubo gateway with its full proxy_cache behavior.
-            proxy_intercept_errors on;
-            error_page 404 500 502 503 504 = @ipfs_gateway_fallback;
-
-            add_header X-Sidecar-Cache $upstream_http_x_sidecar_cache always;
-        }
-
-        location @ipfs_gateway_fallback {
-            gzip off;
-
-            proxy_pass http://ipfs_gateway$request_uri;
+            proxy_pass http://ipfs_gateway;
             proxy_cache ipfs_cache;
             proxy_cache_valid 200 7d;
             proxy_cache_key $uri;
@@ -246,29 +221,14 @@ http {
             proxy_pass_header Access-Control-Expose-Headers;
         }
 
-        # Block get endpoint for direct block retrieval (read-only, safe)
-        # FAST PATH: try the instant-pin cache (sidecar) first; on 404 fall
-        # through to Kubo so publish-then-immediately-read works without the
-        # multi-second Kubo registration window. See issue #6.
+        # Block get endpoint for direct block retrieval (read-only, safe).
+        # NOTE: a previous revision (issue #6) added a sidecar fast-path
+        # here, but POST clients sending non-trivial bodies caused upstream
+        # hangs (the sidecar's /sidecar/blob handler 404s without draining
+        # the body). Reverted to direct pass-through; explicit clients can
+        # still hit /sidecar/blob directly for the fast path.
         location /api/v0/block/get {
-            proxy_pass http://sidecar/sidecar/blob$is_args$args;
-            proxy_connect_timeout 1s;
-            proxy_read_timeout 2s;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-
-            # On 404 (not in cache) or sidecar error, fall back to Kubo.
-            proxy_intercept_errors on;
-            error_page 404 500 502 503 504 = @block_get_fallback;
-
-            proxy_pass_header Access-Control-Allow-Origin;
-            proxy_pass_header Access-Control-Allow-Methods;
-            proxy_pass_header Access-Control-Allow-Headers;
-            proxy_pass_header Access-Control-Expose-Headers;
-        }
-
-        location @block_get_fallback {
-            proxy_pass http://127.0.0.1:5001/api/v0/block/get$is_args$args;
+            proxy_pass http://127.0.0.1:5001;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_read_timeout 60s;
