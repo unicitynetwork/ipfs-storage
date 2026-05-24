@@ -113,11 +113,22 @@ http {
             proxy_pass http://ipfs_gateway;
             proxy_cache ipfs_cache;
             proxy_cache_valid 200 7d;
-            proxy_cache_key $uri;
+
+            # CRITICAL: cache key MUST include format/codec selectors. The Kubo
+            # gateway picks the response codec based on both ?format=<x> and
+            # the Accept header (per IPIP-328 + the Gateway spec). A bare
+            # $uri cache key collides the dag-cbor (default) response with
+            # the CAR response (?format=car), poisoning the cache for any
+            # CID first fetched without ?format=car. Symptoms: 339-byte
+            # dag-cbor body served when CAR was requested; CarReader.fromBytes
+            # rejects the missing CAR magic header.
+            proxy_cache_key "$uri|format=$arg_format|accept=$http_accept";
+
             proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
             proxy_cache_background_update on;
             proxy_cache_lock on;
             add_header X-Cache-Status $upstream_cache_status;
+            add_header X-Cache-Key "$uri|format=$arg_format|accept=$http_accept" always;
 
             # NOTE: Do not override Accept header - Kubo 0.39+ runs in trustless mode
             # by default (Gateway.DeserializedResponses=null) and rejects non-trustless
@@ -142,7 +153,10 @@ http {
             proxy_pass http://ipfs_gateway;
             proxy_cache ipfs_cache;
             proxy_cache_valid 200 30s;
-            proxy_cache_key $uri;  # Ignore query params for stable caching
+            # See /ipfs/ above for the rationale. The Kubo gateway also
+            # honors ?format=<x>/Accept on /ipns/ — partition the cache by
+            # both so a CAR fetch does not pull a poisoned dag-cbor entry.
+            proxy_cache_key "$uri|format=$arg_format|accept=$http_accept";
             proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
             proxy_cache_background_update on;
             proxy_cache_lock on;
