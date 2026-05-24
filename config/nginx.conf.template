@@ -207,6 +207,24 @@ http {
             proxy_pass_header Access-Control-Expose-Headers;
         }
 
+        # DAG put endpoint for UXF Profile CAR uploads (dag-cbor encoded blocks).
+        # sphere-sdk's CAR pin path posts dag-cbor blocks here via
+        # /api/v0/dag/put?input-codec=raw&store-codec=raw&pin=true. Without this
+        # location, nginx falls through to the gateway and returns 404 because
+        # the Kubo gateway (port 8080) does not expose the API surface.
+        location /api/v0/dag/put {
+            client_max_body_size 50M;
+            proxy_pass http://127.0.0.1:5001;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 120s;
+            proxy_send_timeout 120s;
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
         # Safe API proxy for content preloading (refs triggers fetch via bitswap)
         location /api/v0/refs {
             client_max_body_size 10M;
