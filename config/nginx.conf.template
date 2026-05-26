@@ -273,13 +273,38 @@ http {
         # Instant-pin cache submit + read endpoints (issue #6).
         # Clients that hold the raw CAR/block bytes can POST them here to make
         # the CID retrievable instantly, before Kubo registers it.
+        #
+        # CORS: browser callers (sphere webpage, agentsphere, …) are
+        # cross-origin to this host. The sidecar service itself does not
+        # emit CORS headers, so nginx must handle preflight (OPTIONS) and
+        # add allow-origin to the POST/GET responses. Mirrors the pattern
+        # used by /api/v0/routing/get and /pin-status above.
         location /sidecar/ {
+            # Handle CORS preflight before passing to sidecar (which would
+            # otherwise 405 OPTIONS — observed on sphere-telco-test.dyndns.org
+            # blocking the CAR-block submit during UXF send pipeline).
+            if ($request_method = 'OPTIONS') {
+                add_header Access-Control-Allow-Origin * always;
+                add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+                add_header Access-Control-Allow-Headers "Content-Type, Accept" always;
+                add_header Access-Control-Max-Age 86400 always;
+                add_header Content-Length 0;
+                add_header Content-Type text/plain;
+                return 204;
+            }
+
             client_max_body_size 50M;
             proxy_pass http://sidecar;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_read_timeout 60s;
             proxy_send_timeout 60s;
+
+            # Add CORS headers to all responses (sidecar service doesn't add
+            # them itself). `always` so they're emitted on 4xx/5xx too.
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, Accept" always;
         }
 
         # Add endpoint for direct content upload from browser
