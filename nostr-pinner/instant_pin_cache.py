@@ -24,7 +24,7 @@ falls back to Kubo on 404 for the public /ipfs/<cid> path.
 Capacity / back-pressure
 ------------------------
 The cache is bounded by total bytes (SIDECAR_CACHE_MAX_BYTES, default 1 GiB)
-AND entry count (SIDECAR_CACHE_MAX_ENTRIES, default 10_000). When full:
+AND entry count (SIDECAR_CACHE_MAX_ENTRIES, default 100_000). When full:
 
 * If there is room to evict already-confirmed (`in-kubo`) entries, evict LRU.
 * If only `pending` entries remain, refuse the new submit with HTTP 503 so
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = "/data/ipfs/sidecar-cache"
 DEFAULT_MAX_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
-DEFAULT_MAX_ENTRIES = 10_000
+DEFAULT_MAX_ENTRIES = 100_000
 DEFAULT_RECONCILE_INTERVAL = 5  # seconds
 DEFAULT_PROMOTION_TIMEOUT = 24 * 60 * 60  # 24h alert threshold
 DEFAULT_KUBO_PIN_TIMEOUT = 30  # seconds; per-promotion call cap
