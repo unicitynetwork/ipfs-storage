@@ -239,6 +239,64 @@ http {
             proxy_pass_header Access-Control-Expose-Headers;
         }
 
+        # DAG import endpoint for CAR-batched UXF Profile pushes
+        # (sphere-sdk #370 Part 1). Replaces the per-block /dag/put loop
+        # with a SINGLE multipart POST of the full CAR — eliminates the
+        # burst of N parallel /dag/put requests during §D.1 pre-clear
+        # snapshots. Capability-probed once per process by the SDK at
+        # startup; absence here (404 or 405) makes the SDK transparently
+        # fall back to the per-block /dag/put path above.
+        #
+        # client_max_body_size: 100M — CAR-batched bundles carry the
+        # full pin payload in a single body (vs ~50KB-1MB per individual
+        # block on /dag/put). Sized generously above the typical Profile
+        # snapshot (~few MB) to avoid 413 truncation on large wallets.
+        #
+        # Timeouts: 300s — Kubo's internal pin of every block in a
+        # large CAR takes several seconds end-to-end; allow headroom
+        # over the typical ~1-2s import time so a slow inner CAR walk
+        # doesn't surface as a spurious gateway-side timeout that
+        # triggers the SDK's legacy fallback unnecessarily.
+        location /api/v0/dag/import {
+            client_max_body_size 100M;
+            proxy_pass http://127.0.0.1:5001;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
+        # DAG export endpoint for CAR-batched UXF Profile fetches
+        # (sphere-sdk #370 Part 1). Replaces the per-block BFS walk
+        # (one /api/v0/block/get per block) with a single CAR stream
+        # rooted at the requested CID. Capability-probed by the SDK;
+        # absence here transparently falls the SDK back to the BFS
+        # path above.
+        #
+        # proxy_buffering off: response CARs can be tens of MB and
+        # are content-addressed (verified end-to-end by the receiver).
+        # Buffering provides no value and would pile bytes up in
+        # nginx's worker memory under concurrent fetches.
+        #
+        # No client_max_body_size needed — the request body is the
+        # query string (`?arg=<cid>`); the bytes flow the other way.
+        location /api/v0/dag/export {
+            proxy_pass http://127.0.0.1:5001;
+            proxy_buffering off;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_pass_header Access-Control-Allow-Origin;
+            proxy_pass_header Access-Control-Allow-Methods;
+            proxy_pass_header Access-Control-Allow-Headers;
+            proxy_pass_header Access-Control-Expose-Headers;
+        }
+
         # Safe API proxy for content preloading (refs triggers fetch via bitswap)
         location /api/v0/refs {
             client_max_body_size 10M;
