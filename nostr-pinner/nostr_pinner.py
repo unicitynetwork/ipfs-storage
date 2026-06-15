@@ -868,14 +868,14 @@ async def fetch_cid_content(cid: str, timeout: int = CID_FETCH_TIMEOUT) -> Optio
             timeout=timeout
         )
 
-        if response.status_code != 200:
-            logger.warning(f"CID fetch failed for {cid[:16]}...: status={response.status_code}")
+        try:
+            if response.status_code != 200:
+                logger.warning(f"CID fetch failed for {cid[:16]}...: status={response.status_code}")
+                return None
+            # Parse JSON content
+            content = response.json()
+        finally:
             await response.aclose()
-            return None
-
-        # Parse JSON content
-        content = response.json()
-        await response.aclose()
 
         # Validate content has expected structure
         if not isinstance(content, dict):
@@ -1361,12 +1361,15 @@ class RateLimitedPinQueue:
                 timeout=PIN_TIMEOUT
             )
 
-            await response.aclose()
-            if response.status_code == 200:
+            try:
+                status = response.status_code
+            finally:
+                await response.aclose()
+            if status == 200:
                 logger.info(f"Pinned: {cid[:16]}...")
                 return True
             else:
-                logger.warning(f"Pin failed for {cid[:16]}...: HTTP {response.status_code}")
+                logger.warning(f"Pin failed for {cid[:16]}...: HTTP {status}")
                 return False
         except httpx.TimeoutException:
             logger.warning(f"Timeout pinning {cid[:16]}...")
@@ -1575,9 +1578,11 @@ class IpnsRecordStore:
                 timeout=30
             )
 
-            status = response.status_code
-            detail = response.text[:100] if status != 200 else ""
-            await response.aclose()
+            try:
+                status = response.status_code
+                detail = response.text[:100] if status != 200 else ""
+            finally:
+                await response.aclose()
             if status == 200:
                 logger.info(f"Republished IPNS: {ipns_name[:16]}...")
                 return True
@@ -1685,12 +1690,12 @@ class DhtSyncWorker:
                 params={"arg": f"/ipns/{ipns_name}"}
             )
 
-            if response.status_code != 200:
+            try:
+                if response.status_code != 200:
+                    return
+                kubo_data = response.json()
+            finally:
                 await response.aclose()
-                return
-
-            kubo_data = response.json()
-            await response.aclose()
             if not kubo_data.get('Extra'):
                 return
 
@@ -2313,9 +2318,11 @@ class IpnsInterceptServer:
                 f"{IPFS_API_URL}/api/v0/routing/get",
                 params={"arg": f"/ipns/{ipns_name}"}
             )
-            status = response.status_code
-            kubo_data = response.json() if status == 200 else None
-            await response.aclose()
+            try:
+                status = response.status_code
+                kubo_data = response.json() if status == 200 else None
+            finally:
+                await response.aclose()
             if status == 200 and kubo_data:
                 if kubo_data.get('Extra'):
                     record_bytes = base64.b64decode(kubo_data['Extra'])
@@ -2357,9 +2364,11 @@ class IpnsInterceptServer:
                 params={"arg": f"/ipns/{ipns_name}"}
             )
 
-            status = response.status_code
-            kubo_data = response.json() if status == 200 else None
-            await response.aclose()
+            try:
+                status = response.status_code
+                kubo_data = response.json() if status == 200 else None
+            finally:
+                await response.aclose()
 
             if status != 200:
                 logger.debug(f"Background refresh: DHT returned {status} for {ipns_name[:16]}...")
@@ -2452,7 +2461,9 @@ class IpnsInterceptServer:
                     # Non-blocking: queue DHT sync task with WebSocket push.
                     # Bounded to _max_refresh_tasks to prevent unbounded memory
                     # growth from concurrent DHT lookups.
-                    self._refresh_tasks = {t for t in self._refresh_tasks if not t.done()}
+                    # Prune in-place to preserve callback→set binding
+                    done = {t for t in self._refresh_tasks if t.done()}
+                    self._refresh_tasks -= done
                     if len(self._refresh_tasks) < self._max_refresh_tasks:
                         task = asyncio.create_task(self._refresh_and_push(ipns_name))
                         self._refresh_tasks.add(task)
@@ -2821,9 +2832,11 @@ async def check_ipfs_connection() -> bool:
     try:
         client = get_shared_http_client()
         response = await client.post(f"{IPFS_API_URL}/api/v0/id")
-        status = response.status_code
-        data = response.json() if status == 200 else None
-        await response.aclose()
+        try:
+            status = response.status_code
+            data = response.json() if status == 200 else None
+        finally:
+            await response.aclose()
         if status == 200:
             peer_id = data.get("ID", "unknown")
             logger.info(f"Connected to IPFS node: {peer_id}")
@@ -3019,6 +3032,12 @@ async def main():
 
     # Cleanup HTTP server
     await http_runner.cleanup()
+
+    # Close shared httpx client
+    global _shared_http_client
+    if _shared_http_client is not None:
+        await _shared_http_client.aclose()
+        _shared_http_client = None
 
     # Close database
     db.close()
