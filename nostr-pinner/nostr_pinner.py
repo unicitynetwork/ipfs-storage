@@ -2125,11 +2125,34 @@ class IpnsInterceptServer:
         self.app.router.add_get('/pin-status', self._handle_pin_status)
         # WebSocket endpoint for IPNS subscriptions
         self.app.router.add_get('/ws/ipns', self.subscription_manager.handle_websocket)
+        # Go sidecar → Python WS notification callback (issue #17)
+        self.app.router.add_post('/internal/ws-notify', self._handle_ws_notify)
         # Instant-pin write-through cache endpoints (issue #6)
         self.app.router.add_post('/sidecar/submit', self._handle_sidecar_submit)
         self.app.router.add_get('/sidecar/blob', self._handle_sidecar_blob)
         self.app.router.add_post('/sidecar/blob', self._handle_sidecar_blob)
         self.app.router.add_get('/sidecar/cache-stats', self._handle_sidecar_cache_stats)
+
+    async def _handle_ws_notify(self, request: web.Request) -> web.Response:
+        """
+        Handle WebSocket notification callback from Go sidecar (issue #17).
+
+        When the Go sidecar refreshes a stale IPNS record from the DHT and
+        finds a newer sequence, it POSTs here so we can push the update to
+        connected WebSocket subscribers.
+        """
+        try:
+            ipns_name = request.query.get('name', '')
+            sequence = int(request.query.get('sequence', '0'))
+            cid = request.query.get('cid', '')
+
+            if ipns_name and sequence > 0:
+                await self.subscription_manager.notify(ipns_name, sequence, cid or None)
+
+            return web.Response(status=204)
+        except Exception as e:
+            logger.debug(f"ws-notify error: {e}")
+            return web.Response(status=204)  # Non-critical, always return OK
 
     async def _handle_ipns_intercept(self, request: web.Request) -> web.Response:
         """
