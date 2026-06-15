@@ -460,9 +460,10 @@ async def notify_go_sidecar_ws(ipns_name: str, sequence: int, cid: str | None):
     Fire-and-forget: failures are non-critical.
     """
     try:
+        from urllib.parse import urlencode
         go_url = os.getenv("GO_SIDECAR_URL", "http://127.0.0.1:9082")
-        url = f"{go_url}/internal/ws-notify?name={ipns_name}&sequence={sequence}&cid={cid or ''}"
-        response = await get_shared_http_client().post(url)
+        params = urlencode({"name": ipns_name, "sequence": sequence, "cid": cid or ""})
+        response = await get_shared_http_client().post(f"{go_url}/internal/ws-notify?{params}")
         await response.aclose()
     except Exception:
         pass  # Non-critical: WS clients will get update on next poll

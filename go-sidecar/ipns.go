@@ -79,9 +79,14 @@ func parseIPNSRecord(data []byte) (sequence int64, cid string) {
 				value = string(fieldData)
 			}
 
+		case 1: // 64-bit fixed (double, fixed64, sfixed64)
+			pos += 8
+
+		case 5: // 32-bit fixed (float, fixed32, sfixed32)
+			pos += 4
+
 		default:
-			// Unknown wire type — cannot safely skip without knowing the
-			// encoding. Stop parsing rather than risk misinterpreting data.
+			// Unknown wire type — cannot safely skip.
 			return sequence, cid
 		}
 	}

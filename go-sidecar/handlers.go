@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"sync"
@@ -189,7 +190,7 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 
 // fetchFromKubo fetches an IPNS record from the kubo DHT API.
 func fetchFromKubo(client *http.Client, kuboURL, ipnsName string) ([]byte, int64, error) {
-	url := fmt.Sprintf("%s/api/v0/routing/get?arg=/ipns/%s", kuboURL, ipnsName)
+	url := fmt.Sprintf("%s/api/v0/routing/get?arg=%s", kuboURL, url.QueryEscape("/ipns/"+ipnsName))
 	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
 		return nil, 0, err

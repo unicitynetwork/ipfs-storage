@@ -11,55 +11,105 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	// MaxSubscriptionsPerConn limits how many IPNS names a single client
+	// can subscribe to, preventing memory exhaustion from malicious clients.
+	MaxSubscriptionsPerConn = 200
+
+	// MaxTotalConnections limits the total number of concurrent WebSocket
+	// connections the sidecar will accept.
+	MaxTotalConnections = 1000
+
+	// wsReadLimit caps the maximum size of a single WebSocket message.
+	wsReadLimit = 4096
+)
+
 var wsUpgrader = websocket.Upgrader{
-	CheckOrigin:     func(r *http.Request) bool { return true }, // CORS handled by nginx
+	// Origin check intentionally permissive: this is a public IPNS
+	// subscription service. CORS headers are added by nginx. Rate
+	// limiting and subscription caps prevent abuse.
+	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 }
 
+// safeConn wraps a websocket.Conn with a write mutex to prevent
+// concurrent WriteMessage calls (gorilla/websocket is not safe for
+// concurrent writes).
+type safeConn struct {
+	conn *websocket.Conn
+	wmu  sync.Mutex
+	// Number of subscriptions this connection holds.
+	subCount int
+}
+
+func (sc *safeConn) writeJSON(data []byte) error {
+	sc.wmu.Lock()
+	defer sc.wmu.Unlock()
+	sc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return sc.conn.WriteMessage(websocket.TextMessage, data)
+}
+
 // SubscriptionManager manages WebSocket subscriptions for IPNS updates.
-// Clients connect, subscribe to IPNS names, and receive push notifications.
 type SubscriptionManager struct {
 	mu   sync.RWMutex
-	subs map[string]map[*websocket.Conn]struct{} // ipnsName → set of conns
+	subs map[string]map[*safeConn]struct{} // ipnsName → set of conns
+
+	connMu    sync.Mutex
+	connCount int
 }
 
 func NewSubscriptionManager() *SubscriptionManager {
 	return &SubscriptionManager{
-		subs: make(map[string]map[*websocket.Conn]struct{}),
+		subs: make(map[string]map[*safeConn]struct{}),
 	}
 }
 
 // wsMessage is the JSON envelope for client↔server WebSocket messages.
 type wsMessage struct {
-	Action   string   `json:"action,omitempty"`
-	Type     string   `json:"type,omitempty"`
-	Names    []string `json:"names,omitempty"`
-	Name     string   `json:"name,omitempty"`
-	Sequence int64    `json:"sequence,omitempty"`
-	CID      string   `json:"cid,omitempty"`
-	Message  string   `json:"message,omitempty"`
-	// Timestamp is only set on outbound update messages.
-	Timestamp string `json:"timestamp,omitempty"`
+	Action    string   `json:"action,omitempty"`
+	Type      string   `json:"type,omitempty"`
+	Names     []string `json:"names,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Sequence  int64    `json:"sequence,omitempty"`
+	CID       string   `json:"cid,omitempty"`
+	Message   string   `json:"message,omitempty"`
+	Timestamp string   `json:"timestamp,omitempty"`
 }
 
-// ipnsNameRE is already defined in ipns.go — reuse for WS validation.
 var wsIPNSNameRE = regexp.MustCompile(`^(12D3KooW[a-zA-Z0-9]{44}|k[a-z2-7]{50,})$`)
 
 // HandleWebSocket upgrades an HTTP connection and manages subscriptions.
 func (sm *SubscriptionManager) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("ws: upgrade error: %v", err)
+	// Enforce global connection limit.
+	sm.connMu.Lock()
+	if sm.connCount >= MaxTotalConnections {
+		sm.connMu.Unlock()
+		http.Error(w, "Too many connections", http.StatusServiceUnavailable)
 		return
 	}
+	sm.connCount++
+	sm.connMu.Unlock()
+
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		sm.connMu.Lock()
+		sm.connCount--
+		sm.connMu.Unlock()
+		return
+	}
+
+	sc := &safeConn{conn: conn}
+	conn.SetReadLimit(wsReadLimit)
+
 	defer func() {
-		sm.removeAll(conn)
+		sm.removeAll(sc)
 		conn.Close()
+		sm.connMu.Lock()
+		sm.connCount--
+		sm.connMu.Unlock()
 	}()
 
-	// Set read deadline for idle timeout (client should send ping/subscribe
-	// periodically). Reset on every message received.
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
@@ -82,7 +132,7 @@ func (sm *SubscriptionManager) HandleWebSocket(w http.ResponseWriter, r *http.Re
 
 		var msg wsMessage
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
-			sm.sendJSON(conn, wsMessage{Type: "error", Message: "Invalid JSON"})
+			sm.sendJSON(sc, wsMessage{Type: "error", Message: "Invalid JSON"})
 			continue
 		}
 
@@ -90,24 +140,27 @@ func (sm *SubscriptionManager) HandleWebSocket(w http.ResponseWriter, r *http.Re
 		case "subscribe":
 			var valid []string
 			for _, name := range msg.Names {
+				if sc.subCount >= MaxSubscriptionsPerConn {
+					break
+				}
 				if wsIPNSNameRE.MatchString(name) {
-					sm.addSub(name, conn)
+					sm.addSub(name, sc)
 					valid = append(valid, name)
 				}
 			}
-			sm.sendJSON(conn, wsMessage{Type: "subscribed", Names: valid})
+			sm.sendJSON(sc, wsMessage{Type: "subscribed", Names: valid})
 
 		case "unsubscribe":
 			for _, name := range msg.Names {
-				sm.removeSub(name, conn)
+				sm.removeSub(name, sc)
 			}
-			sm.sendJSON(conn, wsMessage{Type: "unsubscribed", Names: msg.Names})
+			sm.sendJSON(sc, wsMessage{Type: "unsubscribed", Names: msg.Names})
 
 		case "ping":
-			sm.sendJSON(conn, wsMessage{Type: "pong"})
+			sm.sendJSON(sc, wsMessage{Type: "pong"})
 
 		default:
-			sm.sendJSON(conn, wsMessage{Type: "error", Message: "Unknown action"})
+			sm.sendJSON(sc, wsMessage{Type: "error", Message: "Unknown action"})
 		}
 	}
 }
@@ -120,8 +173,7 @@ func (sm *SubscriptionManager) Notify(ipnsName string, sequence int64, cid strin
 		sm.mu.RUnlock()
 		return
 	}
-	// Copy the set under read-lock to avoid holding it during writes.
-	targets := make([]*websocket.Conn, 0, len(conns))
+	targets := make([]*safeConn, 0, len(conns))
 	for c := range conns {
 		targets = append(targets, c)
 	}
@@ -139,64 +191,58 @@ func (sm *SubscriptionManager) Notify(ipnsName string, sequence int64, cid strin
 		return
 	}
 
-	for _, c := range targets {
-		if err := c.WriteMessage(websocket.TextMessage, data); err != nil {
-			// Connection broken — remove it.
-			sm.removeAll(c)
-			c.Close()
+	for _, sc := range targets {
+		if err := sc.writeJSON(data); err != nil {
+			sm.removeAll(sc)
+			sc.conn.Close()
 		}
 	}
 }
 
-// ConnectionCount returns the total number of active WebSocket connections.
-func (sm *SubscriptionManager) ConnectionCount() int {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	seen := make(map[*websocket.Conn]struct{})
-	for _, conns := range sm.subs {
-		for c := range conns {
-			seen[c] = struct{}{}
-		}
-	}
-	return len(seen)
-}
-
-func (sm *SubscriptionManager) addSub(ipnsName string, conn *websocket.Conn) {
+func (sm *SubscriptionManager) addSub(ipnsName string, sc *safeConn) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if sm.subs[ipnsName] == nil {
-		sm.subs[ipnsName] = make(map[*websocket.Conn]struct{})
+		sm.subs[ipnsName] = make(map[*safeConn]struct{})
 	}
-	sm.subs[ipnsName][conn] = struct{}{}
+	if _, exists := sm.subs[ipnsName][sc]; !exists {
+		sm.subs[ipnsName][sc] = struct{}{}
+		sc.subCount++
+	}
 }
 
-func (sm *SubscriptionManager) removeSub(ipnsName string, conn *websocket.Conn) {
+func (sm *SubscriptionManager) removeSub(ipnsName string, sc *safeConn) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if conns, ok := sm.subs[ipnsName]; ok {
-		delete(conns, conn)
-		if len(conns) == 0 {
-			delete(sm.subs, ipnsName)
+		if _, exists := conns[sc]; exists {
+			delete(conns, sc)
+			sc.subCount--
+			if len(conns) == 0 {
+				delete(sm.subs, ipnsName)
+			}
 		}
 	}
 }
 
-func (sm *SubscriptionManager) removeAll(conn *websocket.Conn) {
+func (sm *SubscriptionManager) removeAll(sc *safeConn) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	for name, conns := range sm.subs {
-		delete(conns, conn)
-		if len(conns) == 0 {
-			delete(sm.subs, name)
+		if _, exists := conns[sc]; exists {
+			delete(conns, sc)
+			sc.subCount--
+			if len(conns) == 0 {
+				delete(sm.subs, name)
+			}
 		}
 	}
 }
 
-func (sm *SubscriptionManager) sendJSON(conn *websocket.Conn, msg wsMessage) {
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+func (sm *SubscriptionManager) sendJSON(sc *safeConn, msg wsMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-	conn.WriteMessage(websocket.TextMessage, data)
+	sc.writeJSON(data)
 }

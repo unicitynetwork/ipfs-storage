@@ -121,10 +121,11 @@ func main() {
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: mux,
-		// No global ReadTimeout — WebSocket connections are long-lived.
-		// Per-request timeouts are handled in handlers.
-		WriteTimeout: 0, // Disabled for WS; routing-get sets its own.
-		IdleTimeout:  60 * time.Second,
+		// ReadHeaderTimeout limits only the header-reading phase, which is
+		// safe for WebSocket connections (timeout fires before upgrade).
+		// No global ReadTimeout or WriteTimeout — WS connections are long-lived.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
