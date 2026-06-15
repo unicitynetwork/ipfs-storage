@@ -155,11 +155,30 @@ func (h *Handler) triggerAsyncRefresh(ipnsName string, dbSequence int64) {
 			responseJSON := buildResponseJSON(recordBytes)
 			_, cid := parseIPNSRecord(recordBytes)
 			h.store.WriteRecord(ipnsName, recordBytes, responseJSON, seq, cid)
-			h.store.NotifyPython(ipnsName, seq, cid)
+			h.store.NotifyWS(ipnsName, seq, cid)
 		} else {
 			h.store.TouchTimestamp(ipnsName)
 		}
 	}()
+}
+
+// WSNotify handles POST /internal/ws-notify?name=...&sequence=...&cid=...
+// Called by Python ipns-intercept after storing a new IPNS record,
+// so Go can push the update to connected WebSocket subscribers.
+func (h *Handler) WSNotify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ipnsName := r.URL.Query().Get("name")
+	seqStr := r.URL.Query().Get("sequence")
+	cid := r.URL.Query().Get("cid")
+
+	seq, _ := strconv.ParseInt(seqStr, 10, 64)
+	if ipnsName != "" && seq > 0 {
+		h.store.NotifyWS(ipnsName, seq, cid)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Health returns a simple health check response.

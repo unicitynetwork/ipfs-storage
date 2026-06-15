@@ -426,10 +426,10 @@ http {
             add_header Access-Control-Allow-Headers "Content-Type" always;
         }
 
-        # WebSocket endpoint for IPNS subscription updates
+        # WebSocket endpoint for IPNS subscription updates (issue #17: moved to Go sidecar)
         # Clients subscribe to IPNS names and receive push notifications on updates
         location /ws/ipns {
-            proxy_pass http://sidecar/ws/ipns;
+            proxy_pass http://go_sidecar/ws/ipns;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";

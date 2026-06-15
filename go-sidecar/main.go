@@ -1,12 +1,13 @@
-// Go sidecar for IPNS routing-get and DHT refresh.
+// Go sidecar for IPNS routing-get, DHT refresh, and WebSocket subscriptions.
 //
 // Eliminates CPython pymalloc fragmentation (issue #17) by moving the
-// high-throughput read path and DHT refresh out of the Python pinner
-// into a compiled binary with predictable memory behaviour.
+// high-throughput read path, DHT refresh, and WebSocket connections out
+// of the Python pinner into a compiled binary with predictable memory.
 //
 // Shares the SQLite database with the Python pinner via WAL mode.
 // Python handles writes (ipns-intercept, chain validation, Nostr).
-// Go handles reads (/routing-get) and background DHT refresh.
+// Go handles reads (/routing-get), background DHT refresh, and
+// WebSocket push notifications (/ws/ipns).
 package main
 
 import (
@@ -32,7 +33,6 @@ type Config struct {
 	RefreshInterval       time.Duration
 	RefreshBatchSize      int
 	MaxRefreshConcurrency int
-	PythonSidecarURL      string
 }
 
 func loadConfig() Config {
@@ -43,7 +43,6 @@ func loadConfig() Config {
 		StaleThresholdSeconds: envOrInt("STALE_THRESHOLD_SECONDS", 60),
 		RefreshBatchSize:      envOrInt("REFRESH_BATCH_SIZE", 50),
 		MaxRefreshConcurrency: envOrInt("MAX_REFRESH_CONCURRENCY", 10),
-		PythonSidecarURL:      envOr("PYTHON_SIDECAR_URL", "http://127.0.0.1:9081"),
 	}
 	c.RefreshInterval = time.Duration(envOrInt("REFRESH_INTERVAL_SECONDS", 10)) * time.Second
 	return c
@@ -90,13 +89,12 @@ func main() {
 		},
 	}
 
-	// Notification client for Python sidecar WS callbacks (short timeout).
-	notifyClient := &http.Client{Timeout: 2 * time.Second}
+	// WebSocket subscription manager (Go now owns all WS connections).
+	subMgr := NewSubscriptionManager()
 
 	store := &Store{
-		db:           db,
-		notifyClient: notifyClient,
-		pythonURL:    cfg.PythonSidecarURL,
+		db:     db,
+		subMgr: subMgr,
 	}
 
 	handler := &Handler{
@@ -116,13 +114,16 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/routing-get", handler.RoutingGet)
+	mux.HandleFunc("/ws/ipns", subMgr.HandleWebSocket)
+	mux.HandleFunc("/internal/ws-notify", handler.WSNotify)
 	mux.HandleFunc("/health", handler.Health)
 
 	srv := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:    cfg.ListenAddr,
+		Handler: mux,
+		// No global ReadTimeout — WebSocket connections are long-lived.
+		// Per-request timeouts are handled in handlers.
+		WriteTimeout: 0, // Disabled for WS; routing-get sets its own.
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -132,7 +133,7 @@ func main() {
 	go refresher.Run(ctx)
 
 	go func() {
-		log.Printf("Go sidecar listening on %s", cfg.ListenAddr)
+		log.Printf("Go sidecar listening on %s (routing-get, ws/ipns, ws-notify)", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}

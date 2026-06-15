@@ -112,7 +112,7 @@ func (r *Refresher) refreshSingle(ipnsName string, dbSequence int64) {
 		responseJSON := buildResponseJSON(recordBytes)
 		_, cid := parseIPNSRecord(recordBytes)
 		r.store.WriteRecord(ipnsName, recordBytes, responseJSON, seq, cid)
-		r.store.NotifyPython(ipnsName, seq, cid)
+		r.store.NotifyWS(ipnsName, seq, cid)
 		log.Printf("refresh: updated %s seq %d→%d", truncate(ipnsName), dbSequence, seq)
 	} else {
 		r.store.TouchTimestamp(ipnsName)

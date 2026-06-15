@@ -2,17 +2,13 @@ package main
 
 import (
 	"database/sql"
-	"fmt"
 	"log"
-	"net/http"
-	"net/url"
 )
 
-// Store encapsulates shared SQLite write operations and Python notification.
+// Store encapsulates shared SQLite write operations and WebSocket notifications.
 type Store struct {
-	db           *sql.DB
-	notifyClient *http.Client
-	pythonURL    string
+	db     *sql.DB
+	subMgr *SubscriptionManager
 }
 
 // WriteRecord inserts or updates an IPNS record in SQLite.
@@ -57,15 +53,10 @@ func (s *Store) TouchTimestamp(ipnsName string) {
 	)
 }
 
-// NotifyPython sends a POST to the Python sidecar's /internal/ws-notify
-// endpoint so it can push updates to connected WebSocket subscribers.
-// Failures are non-critical — WS clients will get updates on next poll.
-func (s *Store) NotifyPython(ipnsName string, sequence int64, cid string) {
-	notifyURL := fmt.Sprintf("%s/internal/ws-notify?name=%s&sequence=%d&cid=%s",
-		s.pythonURL, url.QueryEscape(ipnsName), sequence, url.QueryEscape(cid))
-	resp, err := s.notifyClient.Post(notifyURL, "", nil)
-	if err != nil {
-		return
+// NotifyWS pushes an IPNS update to all WebSocket subscribers.
+// Called after DHT refresh finds a newer record.
+func (s *Store) NotifyWS(ipnsName string, sequence int64, cid string) {
+	if s.subMgr != nil {
+		s.subMgr.Notify(ipnsName, sequence, cid)
 	}
-	resp.Body.Close()
 }
