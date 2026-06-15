@@ -69,6 +69,11 @@ http {
     # Cache for CID-addressed content (immutable) and IPNS lookups
     proxy_cache_path /var/cache/nginx/ipfs levels=1:2 keys_zone=ipfs_cache:100m max_size=10g inactive=7d use_temp_path=off;
 
+    # Cache for sidecar routing-get responses (IPNS record lookups)
+    # Absorbs repeated lookups for the same IPNS name so they never hit Python.
+    # 10m key zone ≈ 80k entries; 100m max_size is generous for small JSON responses.
+    proxy_cache_path /var/cache/nginx/routing levels=1:2 keys_zone=routing_cache:10m max_size=100m inactive=5m use_temp_path=off;
+
     # Upstream to IPFS Gateway
     upstream ipfs_gateway {
         server 127.0.0.1:8080;
@@ -343,6 +348,7 @@ http {
 
         # Routing get endpoint for IPNS record retrieval
         # FAST PATH: Try sidecar database first (5-20ms), fallback to kubo DHT (1-5s)
+        # nginx proxy_cache absorbs repeated lookups so most requests never hit Python.
         location /api/v0/routing/get {
             # Handle CORS preflight
             if ($request_method = 'OPTIONS') {
@@ -354,6 +360,23 @@ http {
                 add_header Content-Type text/plain;
                 return 204;
             }
+
+            # === Response caching (issue #17) ===
+            # Cache sidecar responses keyed on the IPNS name (?arg=/ipns/<name>).
+            # Eliminates 80-95% of requests hitting the Python sidecar for repeated
+            # lookups, preventing CPython pymalloc arena fragmentation.
+            proxy_cache routing_cache;
+            proxy_cache_key "$arg_arg";
+            # Kubo API clients send POST (not GET), so we must cache POST too.
+            # Safe here: the arg is in query params, POST body is empty.
+            proxy_cache_methods GET POST;
+            proxy_cache_valid 200 30s;
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_504;
+            proxy_cache_background_update on;
+            proxy_cache_lock on;
+            # Allow clients to force a cache bypass for critical reads
+            proxy_cache_bypass $http_x_no_cache;
+            add_header X-Routing-Cache $upstream_cache_status always;
 
             # Try sidecar first (instant DB lookup)
             proxy_pass http://sidecar/routing-get$is_args$args;
@@ -370,7 +393,7 @@ http {
             add_header Access-Control-Allow-Origin * always;
             add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
             add_header Access-Control-Allow-Headers "Content-Type, Accept" always;
-            add_header Access-Control-Expose-Headers "X-IPNS-Source, X-IPNS-Last-Updated" always;
+            add_header Access-Control-Expose-Headers "X-IPNS-Source, X-IPNS-Last-Updated, X-Routing-Cache" always;
         }
 
         # Fallback to kubo DHT resolution when sidecar returns 404
