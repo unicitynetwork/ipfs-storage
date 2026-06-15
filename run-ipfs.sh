@@ -118,6 +118,10 @@ app_docker_args() {
     # Ulimits for IPFS connection handling
     echo "--ulimit nofile=65536:65536"
 
+    # Memory limit: cap at 10GB to prevent runaway consumption
+    echo "--memory 10g"
+    echo "--memory-swap 10g"
+
     # Auto-populate HAProxy extra ports for IPFS protocols
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ] && [ -z "$EXTRA_PORTS" ]; then
         EXTRA_PORTS='[{"listen":4001,"target":4001,"mode":"tcp"},{"listen":4003,"target":4003,"mode":"tcp"},{"listen":9080,"target":9080,"mode":"http"}]'
