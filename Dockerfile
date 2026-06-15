@@ -1,6 +1,15 @@
 # IPFS Storage Service with WSS Support
 # Based on ssl-manager for automatic SSL certificate management and HAProxy integration
 
+# ---- Go sidecar build stage (issue #17) ----
+# Builds the IPNS routing-get sidecar that replaces the Python hot path,
+# eliminating CPython pymalloc fragmentation under high-throughput reads.
+FROM golang:1.22-bookworm AS go-builder
+WORKDIR /build
+COPY go-sidecar/ ./
+RUN go mod tidy && CGO_ENABLED=1 go build -o /go-sidecar -ldflags="-s -w" .
+
+# ---- Main image ----
 FROM ghcr.io/unicitynetwork/ssl-manager:latest
 
 # ssl-manager is based on debian:trixie-slim and already includes:
@@ -53,6 +62,10 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/nostr-requiremen
 COPY nostr-pinner/nostr_pinner.py /usr/local/bin/nostr_pinner.py
 COPY nostr-pinner/instant_pin_cache.py /usr/local/bin/instant_pin_cache.py
 RUN chmod 644 /usr/local/bin/nostr_pinner.py /usr/local/bin/instant_pin_cache.py
+
+# Copy Go sidecar binary (issue #17: IPNS routing-get + DHT refresh)
+COPY --from=go-builder /go-sidecar /usr/local/bin/go-sidecar
+RUN chmod 755 /usr/local/bin/go-sidecar
 
 # Copy configuration files
 COPY config/supervisord.conf /etc/supervisord.conf
@@ -107,6 +120,12 @@ ENV DOMAIN=localhost \
     SIDECAR_CACHE_MAX_BLOB_BYTES="33554432" \
     SIDECAR_CACHE_RECONCILE_INTERVAL="5" \
     SIDECAR_CACHE_PROMOTION_TIMEOUT="86400" \
-    SIDECAR_CACHE_KUBO_TIMEOUT="30"
+    SIDECAR_CACHE_KUBO_TIMEOUT="30" \
+    # Go sidecar configuration (issue #17: IPNS routing-get + DHT refresh)
+    GO_SIDECAR_PORT="9082" \
+    REFRESH_INTERVAL_SECONDS="10" \
+    REFRESH_BATCH_SIZE="50" \
+    MAX_REFRESH_CONCURRENCY="10" \
+    PYTHON_SIDECAR_URL="http://127.0.0.1:9081"
 
 ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
