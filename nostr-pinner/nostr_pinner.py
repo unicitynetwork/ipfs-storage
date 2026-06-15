@@ -266,6 +266,38 @@ def init_database(db_path: str) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
 
+    # Add pre-serialized JSON response column (issue #17: eliminate per-request
+    # base64 + json.dumps allocation that causes CPython pymalloc fragmentation)
+    try:
+        cursor.execute("ALTER TABLE ipns_records ADD COLUMN response_cache TEXT")
+        logger.info("Added response_cache column to ipns_records table")
+    except sqlite3.OperationalError:
+        pass
+
+    # Backfill response_cache for existing rows that don't have it yet.
+    # Process in batches to avoid loading 100k+ rows into memory at once.
+    cursor.execute("SELECT COUNT(*) FROM ipns_records WHERE response_cache IS NULL")
+    backfill_count = cursor.fetchone()[0]
+    if backfill_count > 0:
+        logger.info(f"Backfilling response_cache for {backfill_count} existing records...")
+        batch_size = 1000
+        while True:
+            cursor.execute(
+                "SELECT ipns_name, marshalled_record FROM ipns_records WHERE response_cache IS NULL LIMIT ?",
+                (batch_size,)
+            )
+            batch = cursor.fetchall()
+            if not batch:
+                break
+            for row in batch:
+                response_json = build_routing_response_json(row['marshalled_record'])
+                cursor.execute(
+                    "UPDATE ipns_records SET response_cache = ? WHERE ipns_name = ?",
+                    (response_json, row['ipns_name'])
+                )
+            conn.commit()
+        logger.info("Backfill complete")
+
     # Performance indexes for IPNS lookups (critical for <50ms response time)
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_ipns_name
@@ -394,6 +426,31 @@ def init_database(db_path: str) -> sqlite3.Connection:
 # ==========================================
 # CID Validation
 # ==========================================
+
+_EXTRA_RE = re.compile(rb'"Extra"\s*:\s*"([A-Za-z0-9+/=]+)"')
+
+
+def extract_extra_field(raw_body: bytes) -> str | None:
+    """Extract the base64 'Extra' value from a kubo routing/get JSON response.
+
+    Uses a regex on raw bytes instead of json.loads() to avoid creating a
+    full Python dict/str object tree.  At 15+ req/sec on the DHT refresh
+    path this eliminates the #1 allocator identified in issue #17's
+    tracemalloc data (json/decoder.py: 713 MB / 7M objects).
+    """
+    m = _EXTRA_RE.search(raw_body)
+    return m.group(1).decode('ascii') if m else None
+
+
+def build_routing_response_json(record_bytes: bytes) -> str:
+    """Pre-serialize the routing-get JSON response for a marshalled IPNS record.
+
+    Returns the exact JSON string that _handle_routing_get would return,
+    avoiding per-request base64 encoding and json.dumps allocation.
+    Called once on the write path so the read path returns raw bytes.
+    """
+    return '{"Extra":"' + base64.b64encode(record_bytes).decode('ascii') + '","Type":5}'
+
 
 def is_valid_cid(cid: str) -> bool:
     """Validate CID format (CIDv0 or CIDv1)."""
@@ -1516,14 +1573,17 @@ class IpnsRecordStore:
                     version = 0
                     last_cid_to_store = None
 
+                # Pre-serialize the JSON response for the read path (issue #17)
+                response_json = build_routing_response_json(record_bytes)
+
                 # Store the record with optimistic locking (using lock_version, not content version)
                 if row is None:
                     # INSERT for new records (lock_version starts at 1)
                     cursor.execute(
                         """INSERT INTO ipns_records
-                           (ipns_name, marshalled_record, cid, sequence, last_cid, version, lock_version, last_updated)
-                           VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)""",
-                        (ipns_name, record_bytes, cid, new_sequence, last_cid_to_store, version)
+                           (ipns_name, marshalled_record, cid, sequence, last_cid, version, lock_version, response_cache, last_updated)
+                           VALUES (?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)""",
+                        (ipns_name, record_bytes, cid, new_sequence, last_cid_to_store, version, response_json)
                     )
                 else:
                     # UPDATE with lock_version check (optimistic lock)
@@ -1531,9 +1591,9 @@ class IpnsRecordStore:
                     cursor.execute(
                         """UPDATE ipns_records
                            SET marshalled_record=?, cid=?, sequence=?, last_cid=?, version=?,
-                               lock_version = lock_version + 1, last_updated=CURRENT_TIMESTAMP
+                               response_cache=?, lock_version = lock_version + 1, last_updated=CURRENT_TIMESTAMP
                            WHERE ipns_name = ? AND lock_version = ?""",
-                        (record_bytes, cid, new_sequence, last_cid_to_store, version, ipns_name, db_lock_version)
+                        (record_bytes, cid, new_sequence, last_cid_to_store, version, response_json, ipns_name, db_lock_version)
                     )
 
                     if cursor.rowcount == 0:
@@ -1693,13 +1753,14 @@ class DhtSyncWorker:
             try:
                 if response.status_code != 200:
                     return
-                kubo_data = response.json()
+                raw_body = response.content
             finally:
                 await response.aclose()
-            if not kubo_data.get('Extra'):
+            extra_b64 = extract_extra_field(raw_body)
+            if not extra_b64:
                 return
 
-            record_bytes = base64.b64decode(kubo_data['Extra'])
+            record_bytes = base64.b64decode(extra_b64)
             kubo_sequence, cid = parse_ipns_record(record_bytes)
 
             # Only update if DHT has newer record
@@ -2320,12 +2381,13 @@ class IpnsInterceptServer:
             )
             try:
                 status = response.status_code
-                kubo_data = response.json() if status == 200 else None
+                raw_body = response.content if status == 200 else None
             finally:
                 await response.aclose()
-            if status == 200 and kubo_data:
-                if kubo_data.get('Extra'):
-                    record_bytes = base64.b64decode(kubo_data['Extra'])
+            if status == 200 and raw_body:
+                extra_b64 = extract_extra_field(raw_body)
+                if extra_b64:
+                    record_bytes = base64.b64decode(extra_b64)
                     sequence, cid = parse_ipns_record(record_bytes)
 
                     # Store in SQLite for future fast lookups
@@ -2334,10 +2396,12 @@ class IpnsInterceptServer:
                     # Notify WebSocket subscribers
                     await self.subscription_manager.notify(ipns_name, sequence, cid)
 
+                    # Return the pre-serialized response (avoid json.dumps)
+                    response_json = build_routing_response_json(record_bytes)
                     return web.Response(
                         status=200,
                         content_type='application/json',
-                        text=json.dumps(kubo_data),
+                        body=response_json.encode('ascii'),
                         headers={
                             'X-IPNS-Source': 'kubo',
                             'X-IPNS-Sequence': str(sequence)
@@ -2366,7 +2430,7 @@ class IpnsInterceptServer:
 
             try:
                 status = response.status_code
-                kubo_data = response.json() if status == 200 else None
+                raw_body = response.content if status == 200 else None
             finally:
                 await response.aclose()
 
@@ -2374,10 +2438,11 @@ class IpnsInterceptServer:
                 logger.debug(f"Background refresh: DHT returned {status} for {ipns_name[:16]}...")
                 return
 
-            if not kubo_data or not kubo_data.get('Extra'):
+            extra_b64 = extract_extra_field(raw_body) if raw_body else None
+            if not extra_b64:
                 return
 
-            record_bytes = base64.b64decode(kubo_data['Extra'])
+            record_bytes = base64.b64decode(extra_b64)
             sequence, cid = parse_ipns_record(record_bytes)
 
             # Store in cache (this validates sequence and chain)
@@ -2423,13 +2488,14 @@ class IpnsInterceptServer:
             # 1. Query SQLite immediately (5-20ms)
             cursor = self.db.cursor()
             cursor.execute(
-                'SELECT marshalled_record, cid, sequence, last_updated FROM ipns_records WHERE ipns_name = ?',
+                'SELECT marshalled_record, response_cache, sequence, last_updated FROM ipns_records WHERE ipns_name = ?',
                 (ipns_name,)
             )
             row = cursor.fetchone()
 
             if row:
                 db_record = row['marshalled_record']
+                cached_json = row['response_cache']
                 db_sequence = row['sequence'] or 0
                 last_updated = row['last_updated']
 
@@ -2472,15 +2538,15 @@ class IpnsInterceptServer:
                     else:
                         logger.debug(f"routing-get: Skipped refresh for {ipns_name[:16]}... (max {self._max_refresh_tasks} tasks in flight)")
 
-                # Return immediately from SQLite with staleness headers
-                response_data = {
-                    "Extra": base64.b64encode(db_record).decode('ascii'),
-                    "Type": 5
-                }
+                # Return pre-serialized JSON from SQLite (issue #17: avoids
+                # per-request base64 + json.dumps allocation that caused
+                # CPython pymalloc arena fragmentation at ~250 MB/min).
+                # Fallback to on-the-fly construction for rows not yet backfilled.
+                response_body = cached_json or build_routing_response_json(db_record)
                 return web.Response(
                     status=200,
                     content_type='application/json',
-                    text=json.dumps(response_data),
+                    body=response_body.encode('ascii'),
                     headers={
                         'X-IPNS-Source': 'sidecar-cache',
                         'X-IPNS-Sequence': str(db_sequence),

@@ -112,7 +112,7 @@ init_ipfs() {
 configure_nginx() {
     echo "[entrypoint] Rendering nginx configuration..."
 
-    mkdir -p /var/cache/nginx/ipfs
+    mkdir -p /var/cache/nginx/ipfs /var/cache/nginx/routing
     chown -R www-data:www-data /var/cache/nginx
 
     envsubst '${DOMAIN} ${SSL_CERT_PATH} ${SSL_KEY_PATH}' \
