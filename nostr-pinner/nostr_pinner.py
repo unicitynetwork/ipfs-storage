@@ -43,6 +43,8 @@ import re
 import secrets
 import signal
 import sqlite3
+import ctypes
+import gc
 import struct
 import sys
 import time
@@ -57,6 +59,17 @@ import secp256k1
 import websockets
 from aiohttp import web
 from websockets.exceptions import ConnectionClosed
+
+# Module-level shared httpx client — avoids creating/destroying connection
+# pools on every request, which caused severe memory growth under load.
+_shared_http_client: Optional[httpx.AsyncClient] = None
+
+def get_shared_http_client() -> httpx.AsyncClient:
+    """Get or create the shared httpx client for IPFS API calls."""
+    global _shared_http_client
+    if _shared_http_client is None:
+        _shared_http_client = httpx.AsyncClient(timeout=30)
+    return _shared_http_client
 
 from instant_pin_cache import (
     InstantPinCache,
@@ -847,46 +860,49 @@ async def fetch_cid_content(cid: str, timeout: int = CID_FETCH_TIMEOUT) -> Optio
         return cached
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            # Use IPFS cat API to fetch content
-            response = await client.post(
-                f"{IPFS_API_URL}/api/v0/cat",
-                params={"arg": cid}
-            )
+        client = get_shared_http_client()
+        # Use IPFS cat API to fetch content
+        response = await client.post(
+            f"{IPFS_API_URL}/api/v0/cat",
+            params={"arg": cid},
+            timeout=timeout
+        )
 
-            if response.status_code != 200:
-                logger.warning(f"CID fetch failed for {cid[:16]}...: status={response.status_code}")
+        if response.status_code != 200:
+            logger.warning(f"CID fetch failed for {cid[:16]}...: status={response.status_code}")
+            await response.aclose()
+            return None
+
+        # Parse JSON content
+        content = response.json()
+        await response.aclose()
+
+        # Validate content has expected structure
+        if not isinstance(content, dict):
+            logger.warning(f"CID {cid[:16]}... contains non-dict content (type={type(content).__name__})")
+            return None
+
+        # Check for token data OR _meta field (valid wallet content)
+        # IPFS empty nodes typically have only Data/Links fields
+        ipfs_internal_keys = {'Data', 'Links'}
+        actual_keys = set(content.keys())
+        non_ipfs_keys = actual_keys - ipfs_internal_keys
+
+        has_tokens = any(k not in ('_meta', 'Data', 'Links') for k in content.keys())
+        has_meta = '_meta' in content and isinstance(content.get('_meta'), dict)
+
+        if not has_tokens and not has_meta:
+            # Content appears empty or has only IPFS internal fields
+            if non_ipfs_keys:
+                # Has some custom keys but no tokens or meta - might be valid, log warning
+                logger.debug(f"CID {cid[:16]}... has custom keys but no tokens/_meta: {non_ipfs_keys}")
+            else:
+                # Only Data/Links - definitely empty
+                logger.warning(f"CID {cid[:16]}... appears empty (only Data/Links), not caching")
                 return None
 
-            # Parse JSON content
-            content = response.json()
-
-            # Validate content has expected structure
-            if not isinstance(content, dict):
-                logger.warning(f"CID {cid[:16]}... contains non-dict content (type={type(content).__name__})")
-                return None
-
-            # Check for token data OR _meta field (valid wallet content)
-            # IPFS empty nodes typically have only Data/Links fields
-            ipfs_internal_keys = {'Data', 'Links'}
-            actual_keys = set(content.keys())
-            non_ipfs_keys = actual_keys - ipfs_internal_keys
-
-            has_tokens = any(k not in ('_meta', 'Data', 'Links') for k in content.keys())
-            has_meta = '_meta' in content and isinstance(content.get('_meta'), dict)
-
-            if not has_tokens and not has_meta:
-                # Content appears empty or has only IPFS internal fields
-                if non_ipfs_keys:
-                    # Has some custom keys but no tokens or meta - might be valid, log warning
-                    logger.debug(f"CID {cid[:16]}... has custom keys but no tokens/_meta: {non_ipfs_keys}")
-                else:
-                    # Only Data/Links - definitely empty
-                    logger.warning(f"CID {cid[:16]}... appears empty (only Data/Links), not caching")
-                    return None
-
-            await cache.set(cid, content)
-            return content
+        await cache.set(cid, content)
+        return content
 
     except httpx.TimeoutException:
         logger.warning(f"CID fetch timeout for {cid[:16]}...")
@@ -1170,20 +1186,9 @@ async def _log_forensic_event_async(
     details: dict
 ):
     """
-    Async forensic logging (non-blocking).
-    Logs to forensic_events table for debugging and analysis.
+    Forensic logging — direct write, no background task.
+    SQLite writes are fast (~1ms); fire-and-forget tasks leaked memory.
     """
-    # Schedule the actual write as a background task to avoid blocking
-    asyncio.create_task(_write_forensic_log(db, event_type, ipns_name, details))
-
-
-async def _write_forensic_log(
-    db: sqlite3.Connection,
-    event_type: str,
-    ipns_name: str,
-    details: dict
-):
-    """Background log writer for forensic events."""
     try:
         cursor = db.cursor()
         cursor.execute(
@@ -1242,22 +1247,7 @@ async def log_security_audit(
     - rate_limit_triggered: Request blocked by rate limiter
     - signature_verification_failed: IPNS signature verification failed
     """
-    # Schedule as background task to avoid blocking request handling
-    asyncio.create_task(_write_security_audit(
-        db, event_type, client_ip, ipns_name, outcome, reason, details
-    ))
-
-
-async def _write_security_audit(
-    db: sqlite3.Connection,
-    event_type: str,
-    client_ip: str,
-    ipns_name: Optional[str],
-    outcome: str,
-    reason: Optional[str],
-    details: Optional[dict]
-):
-    """Background writer for security audit log."""
+    # Direct write — no background task to avoid memory leak from task accumulation
     try:
         cursor = db.cursor()
         cursor.execute(
@@ -1364,18 +1354,20 @@ class RateLimitedPinQueue:
     async def _pin_cid(self, cid: str) -> bool:
         """Pin a CID to the local IPFS node."""
         try:
-            async with httpx.AsyncClient(timeout=PIN_TIMEOUT) as client:
-                response = await client.post(
-                    f"{IPFS_API_URL}/api/v0/pin/add",
-                    params={"arg": cid, "progress": "false"}
-                )
+            client = get_shared_http_client()
+            response = await client.post(
+                f"{IPFS_API_URL}/api/v0/pin/add",
+                params={"arg": cid, "progress": "false"},
+                timeout=PIN_TIMEOUT
+            )
 
-                if response.status_code == 200:
-                    logger.info(f"Pinned: {cid[:16]}...")
-                    return True
-                else:
-                    logger.warning(f"Pin failed for {cid[:16]}...: HTTP {response.status_code}")
-                    return False
+            await response.aclose()
+            if response.status_code == 200:
+                logger.info(f"Pinned: {cid[:16]}...")
+                return True
+            else:
+                logger.warning(f"Pin failed for {cid[:16]}...: HTTP {response.status_code}")
+                return False
         except httpx.TimeoutException:
             logger.warning(f"Timeout pinning {cid[:16]}...")
             return False
@@ -1572,22 +1564,26 @@ class IpnsRecordStore:
     async def republish_record(self, ipns_name: str, record_bytes: bytes) -> bool:
         """Republish an IPNS record to kubo DHT."""
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                # Kubo routing/put expects multipart form data with 'value-file' field
-                # NOTE: Removed allow-offline=true which was preventing DHT propagation!
-                files = {'value-file': ('record', record_bytes, 'application/octet-stream')}
-                response = await client.post(
-                    f"{IPFS_API_URL}/api/v0/routing/put",
-                    params={"arg": f"/ipns/{ipns_name}"},
-                    files=files
-                )
+            client = get_shared_http_client()
+            # Kubo routing/put expects multipart form data with 'value-file' field
+            # NOTE: Removed allow-offline=true which was preventing DHT propagation!
+            files = {'value-file': ('record', record_bytes, 'application/octet-stream')}
+            response = await client.post(
+                f"{IPFS_API_URL}/api/v0/routing/put",
+                params={"arg": f"/ipns/{ipns_name}"},
+                files=files,
+                timeout=30
+            )
 
-                if response.status_code == 200:
-                    logger.info(f"Republished IPNS: {ipns_name[:16]}...")
-                    return True
-                else:
-                    logger.warning(f"Failed to republish IPNS {ipns_name[:16]}...: {response.status_code} - {response.text[:100]}")
-                    return False
+            status = response.status_code
+            detail = response.text[:100] if status != 200 else ""
+            await response.aclose()
+            if status == 200:
+                logger.info(f"Republished IPNS: {ipns_name[:16]}...")
+                return True
+            else:
+                logger.warning(f"Failed to republish IPNS {ipns_name[:16]}...: {status} - {detail}")
+                return False
         except Exception as e:
             logger.error(f"Error republishing IPNS: {e}")
             return False
@@ -1622,13 +1618,15 @@ class DhtSyncWorker:
         self,
         db: sqlite3.Connection,
         ipns_store: IpnsRecordStore,
-        subscription_manager: 'IpnsSubscriptionManager'
+        subscription_manager: 'IpnsSubscriptionManager',
+        http_client: httpx.AsyncClient = None
     ):
         self.db = db
         self.ipns_store = ipns_store
         self.subscription_manager = subscription_manager
         self.sync_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
         self.in_flight: set[str] = set()  # Deduplicate concurrent syncs
+        self._http_client = http_client
 
     async def run(self, shutdown_event: asyncio.Event):
         """Main sync loop - processes queue of stale IPNS names."""
@@ -1681,41 +1679,43 @@ class DhtSyncWorker:
             db_sequence = row['sequence'] if row else 0
 
             # Query Kubo DHT
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(
-                    f"{IPFS_API_URL}/api/v0/routing/get",
-                    params={"arg": f"/ipns/{ipns_name}"}
+            client = self._http_client or get_shared_http_client()
+            response = await client.post(
+                f"{IPFS_API_URL}/api/v0/routing/get",
+                params={"arg": f"/ipns/{ipns_name}"}
+            )
+
+            if response.status_code != 200:
+                await response.aclose()
+                return
+
+            kubo_data = response.json()
+            await response.aclose()
+            if not kubo_data.get('Extra'):
+                return
+
+            record_bytes = base64.b64decode(kubo_data['Extra'])
+            kubo_sequence, cid = parse_ipns_record(record_bytes)
+
+            # Only update if DHT has newer record
+            if kubo_sequence > db_sequence:
+                logger.info(
+                    f"DHT sync: updating {ipns_name[:16]}... "
+                    f"seq {db_sequence} -> {kubo_sequence}"
                 )
+                await self.ipns_store.store_record(ipns_name, record_bytes)
 
-                if response.status_code != 200:
-                    return
-
-                kubo_data = response.json()
-                if not kubo_data.get('Extra'):
-                    return
-
-                record_bytes = base64.b64decode(kubo_data['Extra'])
-                kubo_sequence, cid = parse_ipns_record(record_bytes)
-
-                # Only update if DHT has newer record
-                if kubo_sequence > db_sequence:
-                    logger.info(
-                        f"DHT sync: updating {ipns_name[:16]}... "
-                        f"seq {db_sequence} -> {kubo_sequence}"
-                    )
-                    await self.ipns_store.store_record(ipns_name, record_bytes)
-
-                    # Notify WebSocket subscribers of update
-                    await self.subscription_manager.notify(
-                        ipns_name, kubo_sequence, cid
-                    )
-                else:
-                    # Just update last_updated timestamp
-                    cursor.execute(
-                        'UPDATE ipns_records SET last_updated = ? WHERE ipns_name = ?',
-                        (datetime.utcnow().isoformat(), ipns_name)
-                    )
-                    self.db.commit()
+                # Notify WebSocket subscribers of update
+                await self.subscription_manager.notify(
+                    ipns_name, kubo_sequence, cid
+                )
+            else:
+                # Just update last_updated timestamp
+                cursor.execute(
+                    'UPDATE ipns_records SET last_updated = ? WHERE ipns_name = ?',
+                    (datetime.utcnow().isoformat(), ipns_name)
+                )
+                self.db.commit()
 
         except Exception as e:
             logger.debug(f"DHT sync failed for {ipns_name[:16]}...: {e}")
@@ -2035,8 +2035,15 @@ class IpnsInterceptServer:
 
         # Initialize DHT sync worker for background synchronization
         self.dht_sync_worker = DhtSyncWorker(
-            db, ipns_store, self.subscription_manager
+            db, ipns_store, self.subscription_manager, get_shared_http_client()
         )
+
+        # Track in-flight background refreshes to prevent duplicate tasks
+        self._refresh_in_flight: set[str] = set()
+        # Bounded set of background refresh tasks — cap concurrency to prevent
+        # unbounded memory growth from thousands of concurrent DHT lookups.
+        self._refresh_tasks: set[asyncio.Task] = set()
+        self._max_refresh_tasks = int(os.getenv("MAX_REFRESH_TASKS", "20"))
 
         self._setup_routes()
 
@@ -2302,32 +2309,33 @@ class IpnsInterceptServer:
     async def _fetch_from_dht_and_store(self, ipns_name: str) -> web.Response:
         """Blocking DHT fetch for records not in cache."""
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(
-                    f"{IPFS_API_URL}/api/v0/routing/get",
-                    params={"arg": f"/ipns/{ipns_name}"}
-                )
-                if response.status_code == 200:
-                    kubo_data = response.json()
-                    if kubo_data.get('Extra'):
-                        record_bytes = base64.b64decode(kubo_data['Extra'])
-                        sequence, cid = parse_ipns_record(record_bytes)
+            response = await get_shared_http_client().post(
+                f"{IPFS_API_URL}/api/v0/routing/get",
+                params={"arg": f"/ipns/{ipns_name}"}
+            )
+            status = response.status_code
+            kubo_data = response.json() if status == 200 else None
+            await response.aclose()
+            if status == 200 and kubo_data:
+                if kubo_data.get('Extra'):
+                    record_bytes = base64.b64decode(kubo_data['Extra'])
+                    sequence, cid = parse_ipns_record(record_bytes)
 
-                        # Store in SQLite for future fast lookups
-                        await self.ipns_store.store_record(ipns_name, record_bytes)
+                    # Store in SQLite for future fast lookups
+                    await self.ipns_store.store_record(ipns_name, record_bytes)
 
-                        # Notify WebSocket subscribers
-                        await self.subscription_manager.notify(ipns_name, sequence, cid)
+                    # Notify WebSocket subscribers
+                    await self.subscription_manager.notify(ipns_name, sequence, cid)
 
-                        return web.Response(
-                            status=200,
-                            content_type='application/json',
-                            text=json.dumps(kubo_data),
-                            headers={
-                                'X-IPNS-Source': 'kubo',
-                                'X-IPNS-Sequence': str(sequence)
-                            }
-                        )
+                    return web.Response(
+                        status=200,
+                        content_type='application/json',
+                        text=json.dumps(kubo_data),
+                        headers={
+                            'X-IPNS-Source': 'kubo',
+                            'X-IPNS-Sequence': str(sequence)
+                        }
+                    )
             return web.Response(status=404, text='Not found')
         except Exception as e:
             logger.error(f"DHT fetch error for {ipns_name[:16]}...: {e}")
@@ -2337,38 +2345,46 @@ class IpnsInterceptServer:
         """
         Background refresh with WebSocket notification (non-blocking).
         Called when serving stale data - refreshes from DHT and pushes update.
+        Deduplicated: only one refresh per IPNS name at a time.
         """
+        if ipns_name in self._refresh_in_flight:
+            return  # Already refreshing this name
+        self._refresh_in_flight.add(ipns_name)
         try:
             # Fetch from DHT (up to 10s timeout)
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(
-                    f"{IPFS_API_URL}/api/v0/routing/get",
-                    params={"arg": f"/ipns/{ipns_name}"}
-                )
+            response = await get_shared_http_client().post(
+                f"{IPFS_API_URL}/api/v0/routing/get",
+                params={"arg": f"/ipns/{ipns_name}"}
+            )
 
-                if response.status_code != 200:
-                    logger.debug(f"Background refresh: DHT returned {response.status_code} for {ipns_name[:16]}...")
-                    return
+            status = response.status_code
+            kubo_data = response.json() if status == 200 else None
+            await response.aclose()
 
-                kubo_data = response.json()
-                if not kubo_data.get('Extra'):
-                    return
+            if status != 200:
+                logger.debug(f"Background refresh: DHT returned {status} for {ipns_name[:16]}...")
+                return
 
-                record_bytes = base64.b64decode(kubo_data['Extra'])
-                sequence, cid = parse_ipns_record(record_bytes)
+            if not kubo_data or not kubo_data.get('Extra'):
+                return
 
-                # Store in cache (this validates sequence and chain)
-                stored = await self.ipns_store.store_record(ipns_name, record_bytes)
+            record_bytes = base64.b64decode(kubo_data['Extra'])
+            sequence, cid = parse_ipns_record(record_bytes)
 
-                if stored:
-                    # Push to all subscribed clients via WebSocket
-                    await self.subscription_manager.notify(ipns_name, sequence, cid)
-                    logger.info(f"Background refresh complete: {ipns_name[:16]}... seq={sequence}")
+            # Store in cache (this validates sequence and chain)
+            stored = await self.ipns_store.store_record(ipns_name, record_bytes)
+
+            if stored:
+                # Push to all subscribed clients via WebSocket
+                await self.subscription_manager.notify(ipns_name, sequence, cid)
+                logger.info(f"Background refresh complete: {ipns_name[:16]}... seq={sequence}")
 
         except asyncio.TimeoutError:
             logger.warning(f"Background refresh timeout for {ipns_name[:16]}...")
         except Exception as e:
             logger.error(f"Background refresh failed for {ipns_name[:16]}...: {e}")
+        finally:
+            self._refresh_in_flight.discard(ipns_name)
 
     async def _handle_routing_get(self, request: web.Request) -> web.Response:
         """
@@ -2433,9 +2449,17 @@ class IpnsInterceptServer:
                 # ALWAYS return cached data immediately (maintains <50ms target)
                 # If stale, trigger non-blocking background refresh
                 if is_stale:
-                    # Non-blocking: queue DHT sync task with WebSocket push
-                    asyncio.create_task(self._refresh_and_push(ipns_name))
-                    logger.debug(f"routing-get: Queued async DHT sync for stale record {ipns_name[:16]}... (age={int(age_seconds)}s)")
+                    # Non-blocking: queue DHT sync task with WebSocket push.
+                    # Bounded to _max_refresh_tasks to prevent unbounded memory
+                    # growth from concurrent DHT lookups.
+                    self._refresh_tasks = {t for t in self._refresh_tasks if not t.done()}
+                    if len(self._refresh_tasks) < self._max_refresh_tasks:
+                        task = asyncio.create_task(self._refresh_and_push(ipns_name))
+                        self._refresh_tasks.add(task)
+                        task.add_done_callback(self._refresh_tasks.discard)
+                        logger.debug(f"routing-get: Queued async DHT sync for stale record {ipns_name[:16]}... (age={int(age_seconds)}s, tasks={len(self._refresh_tasks)})")
+                    else:
+                        logger.debug(f"routing-get: Skipped refresh for {ipns_name[:16]}... (max {self._max_refresh_tasks} tasks in flight)")
 
                 # Return immediately from SQLite with staleness headers
                 response_data = {
@@ -2648,7 +2672,7 @@ class IpnsInterceptServer:
 
     async def start(self):
         """Start the HTTP server."""
-        runner = web.AppRunner(self.app)
+        runner = web.AppRunner(self.app, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', self.port)
         await site.start()
@@ -2795,16 +2819,18 @@ async def subscribe_to_relay(
 async def check_ipfs_connection() -> bool:
     """Check if IPFS API is reachable."""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(f"{IPFS_API_URL}/api/v0/id")
-            if response.status_code == 200:
-                data = response.json()
-                peer_id = data.get("ID", "unknown")
-                logger.info(f"Connected to IPFS node: {peer_id}")
-                return True
-            else:
-                logger.error(f"IPFS API returned status {response.status_code}")
-                return False
+        client = get_shared_http_client()
+        response = await client.post(f"{IPFS_API_URL}/api/v0/id")
+        status = response.status_code
+        data = response.json() if status == 200 else None
+        await response.aclose()
+        if status == 200:
+            peer_id = data.get("ID", "unknown")
+            logger.info(f"Connected to IPFS node: {peer_id}")
+            return True
+        else:
+            logger.error(f"IPFS API returned status {status}")
+            return False
     except Exception as e:
         logger.error(f"Failed to connect to IPFS API: {e}")
         return False
@@ -2913,6 +2939,67 @@ async def main():
         name="instant-pin-reconciler"
     )
 
+    # Periodic rate limiter cleanup to prevent unbounded memory growth
+    async def _rate_limiter_cleanup_loop(shutdown_event: asyncio.Event):
+        limiter = get_rate_limiter()
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.sleep(60)
+                limiter.cleanup_old_entries()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Rate limiter cleanup error: {e}")
+
+    cleanup_task = asyncio.create_task(
+        _rate_limiter_cleanup_loop(shutdown_event),
+        name="rate-limiter-cleanup"
+    )
+
+    # Periodic GC + malloc_trim to combat Python memory fragmentation.
+    # Under high request load, pymalloc fragments the heap; explicit gc.collect()
+    # + malloc_trim() returns freed pages to the OS.
+    # Also monitors RSS and triggers graceful self-restart if memory exceeds limit.
+    max_rss_mb = int(os.getenv("MAX_RSS_MB", "4096"))  # Default 4 GB
+    async def _gc_trim_loop(shutdown_event: asyncio.Event):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            has_malloc_trim = hasattr(libc, 'malloc_trim')
+        except OSError:
+            has_malloc_trim = False
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.sleep(30)
+                gc.collect()
+                if has_malloc_trim:
+                    libc.malloc_trim(0)
+                # Check RSS and trigger graceful restart if too high
+                try:
+                    with open('/proc/self/status') as f:
+                        for line in f:
+                            if line.startswith('VmRSS:'):
+                                rss_kb = int(line.split()[1])
+                                rss_mb = rss_kb // 1024
+                                if rss_mb > max_rss_mb:
+                                    logger.warning(
+                                        f"RSS {rss_mb} MB exceeds limit {max_rss_mb} MB, "
+                                        f"triggering graceful restart"
+                                    )
+                                    shutdown_event.set()
+                                    return
+                                break
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"GC trim error: {e}")
+
+    gc_task = asyncio.create_task(
+        _gc_trim_loop(shutdown_event),
+        name="gc-trim"
+    )
+
     logger.info(f"Service started: {len(relay_tasks)} relay(s), rate-limited queue, scheduler, DHT sync worker, instant-pin reconciler")
 
     # Wait for shutdown
@@ -2922,11 +3009,11 @@ async def main():
     logger.info("Shutting down...")
 
     # Cancel all tasks
-    for task in relay_tasks + [queue_task, scheduler_task, dht_sync_task, instant_pin_task]:
+    for task in relay_tasks + [queue_task, scheduler_task, dht_sync_task, instant_pin_task, cleanup_task, gc_task]:
         task.cancel()
 
     await asyncio.gather(
-        *relay_tasks, queue_task, scheduler_task, dht_sync_task, instant_pin_task,
+        *relay_tasks, queue_task, scheduler_task, dht_sync_task, instant_pin_task, cleanup_task, gc_task,
         return_exceptions=True,
     )
 

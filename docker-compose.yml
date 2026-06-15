@@ -13,6 +13,8 @@ services:
     image: ipfs-storage:latest
     container_name: ipfs-kubo
     restart: always
+    mem_limit: 10g
+    memswap_limit: 10g
     ulimits:
       nofile:
         soft: 65536
