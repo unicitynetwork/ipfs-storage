@@ -220,7 +220,7 @@ sphere-sdk integration tests (see issue
 | `SIDECAR_CACHE_ENABLED` | `true` | Kill switch — set to `false` to skip schema migration and disable all `/sidecar/*` endpoints |
 | `SIDECAR_CACHE_DIR` | `/data/ipfs/sidecar-cache` | Directory for blob bytes (auto-created) |
 | `SIDECAR_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Total cache budget across pending + in-kubo rows |
-| `SIDECAR_CACHE_MAX_ENTRIES` | `10000` | Entry cap (whichever cap hits first) |
+| `SIDECAR_CACHE_MAX_ENTRIES` | `100000` | Entry cap (whichever cap hits first) |
 | `SIDECAR_CACHE_MAX_BLOB_BYTES` | `33554432` (32 MiB) | Per-submission size limit; oversize returns HTTP 413 |
 | `SIDECAR_CACHE_RECONCILE_INTERVAL` | `5` | Seconds between reconciler iterations |
 | `SIDECAR_CACHE_PROMOTION_TIMEOUT` | `86400` (24 h) | Pending rows older than this trigger operator WARN logs (never silently aged out) |
