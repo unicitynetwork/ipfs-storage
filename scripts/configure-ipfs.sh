@@ -42,26 +42,26 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config Addresses.API /ip4/
 # Bind Gateway to all interfaces (within container)
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config Addresses.Gateway /ip4/0.0.0.0/tcp/8080"
 
-# Enable relay client and service with resource caps
+# Relay: keep CLIENT (used in case we're behind NAT), DISABLE SERVICE (we don't
+# forward other peers' traffic — that's pure overhead for a wallet gateway).
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayClient.Enabled true"
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayService '{
-  \"Enabled\": true,
-  \"ConnectionDurationLimit\": \"2m0s\",
-  \"ConnectionDataLimit\": 131072,
-  \"ReservationTTL\": \"60m\",
-  \"MaxReservations\": 64,
-  \"MaxCircuits\": 16,
-  \"BufferSize\": 4096,
-  \"MaxReservationsPerIP\": 8,
-  \"MaxReservationsPerASN\": 32
-}'"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.RelayService.Enabled false"
 
-# Connection manager: cap connections with graceful trimming
-# LowWater/HighWater ratio kept gentle (75%) to avoid connection storm churn
+# Connection manager: aggressive cap for "API-first, light p2p" profile.
+# LowWater 16 / HighWater 64 = node maintains a small mesh for occasional
+# cross-peer bitswap, doesn't try to be a public IPFS supernode.
+# GracePeriod 30s = ConnMgr prunes new peers 4× faster than the default 2m.
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.Type '\"basic\"'"
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.LowWater 96"
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.HighWater 128"
-su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.GracePeriod '\"2m\"'"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.LowWater 16"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.HighWater 64"
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.ConnMgr.GracePeriod '\"30s\"'"
+
+# DHT: leave as "auto" (Kubo modern default: server when publicly reachable,
+# client otherwise). Earlier experiments with "dhtclient" broke the public
+# `/ipfs/<CID>` gateway route — content provider discovery for non-local
+# CIDs timed out because client mode degrades the findProviders walk. The
+# auto-mode load is small enough on this host (~5-15% CPU steady state).
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config Routing.Type auto"
 
 # Add Unicity bootstrap peers
 echo "[IPFS] Adding Unicity bootstrap peers..."
@@ -69,6 +69,15 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicit
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs2.dyndns.org/tcp/4003/wss/p2p/12D3KooWLNi5NDPPHbrfJakAQqwBqymYTTwMQXQKEWuCrJNDdmfh" || true
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4001/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
 su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD bootstrap add /dns4/unicity-ipfs3.dyndns.org/tcp/4003/wss/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6" || true
+
+# === DATASTORE: storage ceiling ===
+# Kubo's default StorageMax is 10 GB — far below the working set of a real
+# gateway. Once RepoSize exceeds StorageMax, kubo enters a continuous GC
+# reclaim loop that fights every pin write (and can cause "silent pin drops"
+# where the API reports success but bytes are GC'd before the next reader
+# can fetch them). 750 GB matches the operator's disk headroom while
+# keeping the cap as a defensive ceiling against runaway growth.
+su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config Datastore.StorageMax 750GB"
 
 # === RESOURCE MANAGER: cap system-wide resources ===
 # Kubo 0.19+ removed Swarm.ResourceMgr.Limits — use libp2p-resource-limit-overrides.json instead
@@ -78,12 +87,12 @@ su -s /bin/sh ipfs -c "IPFS_PATH=/data/ipfs $IPFS_CMD config --json Swarm.Resour
 cat > /data/ipfs/libp2p-resource-limit-overrides.json << 'RESLIMITS'
 {
   "System": {
-    "Conns": 512,
-    "ConnsInbound": 256,
-    "ConnsOutbound": 256,
-    "Streams": 2048,
-    "StreamsInbound": 1024,
-    "StreamsOutbound": 1024,
+    "Conns": 192,
+    "ConnsInbound": 128,
+    "ConnsOutbound": 64,
+    "Streams": 1024,
+    "StreamsInbound": 512,
+    "StreamsOutbound": 512,
     "FD": 4096,
     "Memory": 1610612736
   }
