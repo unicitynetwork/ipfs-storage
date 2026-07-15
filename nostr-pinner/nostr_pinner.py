@@ -27,9 +27,7 @@ Environment Variables:
     ANNOUNCE_PROBABILITY: Probability per second of re-announcement (default: 0.000277778 = 1/3600)
     CHAIN_VALIDATION_ENABLED: Enable version chain validation (default: true)
     CHAIN_VALIDATION_MODE: strict | queue (default: strict)
-    CID_FETCH_TIMEOUT: Timeout for CID content fetches (default: 10)
-    CID_CACHE_SIZE: LRU cache size for CID content (default: 1000)
-    CID_CACHE_TTL: Cache TTL in seconds (default: 60)
+    CID_FETCH_TIMEOUT: Timeout for CID content fetches in Go sidecar (default: 10)
 """
 
 import asyncio
@@ -48,7 +46,7 @@ import gc
 import struct
 import sys
 import time
-from collections import deque, OrderedDict
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -132,9 +130,7 @@ STALE_THRESHOLD_SECONDS = int(os.getenv("STALE_THRESHOLD_SECONDS", "60"))
 # Chain validation configuration
 CHAIN_VALIDATION_ENABLED = os.getenv("CHAIN_VALIDATION_ENABLED", "true").lower() == "true"
 CHAIN_VALIDATION_MODE = os.getenv("CHAIN_VALIDATION_MODE", "strict")  # strict | log_only
-CID_FETCH_TIMEOUT = int(os.getenv("CID_FETCH_TIMEOUT", "10"))
-CID_CACHE_SIZE = int(os.getenv("CID_CACHE_SIZE", "1000"))
-CID_CACHE_TTL = int(os.getenv("CID_CACHE_TTL", "60"))
+CID_FETCH_TIMEOUT = int(os.getenv("CID_FETCH_TIMEOUT", "10"))  # Used as base for Go sidecar call timeout
 
 # IPNS signature verification configuration
 # Set to false initially for gradual rollout, enable after testing
@@ -859,170 +855,12 @@ def get_rate_limiter() -> IpnsRateLimiter:
 
 
 # ==========================================
-# CID Content Cache
+# CID Content Cache & Validation — MOVED TO GO SIDECAR (issue #19)
 # ==========================================
-
-class CidContentCache:
-    """LRU cache for CID content to avoid repeated fetches."""
-
-    def __init__(self, max_size: int = 1000, ttl: int = 60):
-        self.cache: OrderedDict[str, tuple[dict, float]] = OrderedDict()  # cid -> (content, expiry)
-        self.max_size = max_size
-        self.ttl = ttl
-        self.lock = asyncio.Lock()
-
-    async def get(self, cid: str) -> Optional[dict]:
-        """Get cached content if not expired. Moves to end for LRU tracking."""
-        try:
-            async with asyncio.timeout(5):  # 5-second timeout to prevent deadlock
-                async with self.lock:
-                    if cid in self.cache:
-                        content, expiry = self.cache[cid]
-                        if time.time() < expiry:
-                            self.cache.move_to_end(cid)  # Mark as recently used
-                            return content
-                        del self.cache[cid]
-        except asyncio.TimeoutError:
-            logger.error(f"Cache lock timeout for get({cid[:16]}...)")
-        return None
-
-    async def set(self, cid: str, content: dict):
-        """Cache content with TTL using LRU eviction."""
-        try:
-            async with asyncio.timeout(5):  # 5-second timeout to prevent deadlock
-                async with self.lock:
-                    # Remove oldest (first item) if at capacity
-                    if len(self.cache) >= self.max_size:
-                        self.cache.popitem(last=False)  # Remove oldest (FIFO order)
-
-                    self.cache[cid] = (content, time.time() + self.ttl)
-                    self.cache.move_to_end(cid)  # Ensure it's at the end
-        except asyncio.TimeoutError:
-            logger.error(f"Cache lock timeout for set({cid[:16]}...)")
-
-    def invalidate(self, cid: str):
-        """Remove entry from cache."""
-        if cid in self.cache:
-            del self.cache[cid]
-
-
-# Global cache instance
-_cid_cache: Optional[CidContentCache] = None
-
-def get_cid_cache() -> CidContentCache:
-    global _cid_cache
-    if _cid_cache is None:
-        _cid_cache = CidContentCache(CID_CACHE_SIZE, CID_CACHE_TTL)
-    return _cid_cache
-
-
-async def fetch_cid_content(cid: str, timeout: int = CID_FETCH_TIMEOUT) -> Optional[dict]:
-    """
-    Fetch CID content from local IPFS node with content validation.
-    Returns parsed JSON content or None on failure.
-
-    Validates:
-    - Content is a dict (not list or primitive)
-    - Content has tokens OR _meta field (valid wallet content)
-    - Rejects empty content with only Data/Links fields
-    """
-    cache = get_cid_cache()
-
-    # Check cache first
-    cached = await cache.get(cid)
-    if cached is not None:
-        return cached
-
-    try:
-        client = get_shared_http_client()
-        # Use IPFS cat API to fetch content
-        response = await client.post(
-            f"{IPFS_API_URL}/api/v0/cat",
-            params={"arg": cid},
-            timeout=timeout
-        )
-
-        try:
-            if response.status_code != 200:
-                logger.warning(f"CID fetch failed for {cid[:16]}...: status={response.status_code}")
-                return None
-            # Parse JSON content
-            content = response.json()
-        finally:
-            await response.aclose()
-
-        # Validate content has expected structure
-        if not isinstance(content, dict):
-            logger.warning(f"CID {cid[:16]}... contains non-dict content (type={type(content).__name__})")
-            return None
-
-        # Check for token data OR _meta field (valid wallet content)
-        # IPFS empty nodes typically have only Data/Links fields
-        ipfs_internal_keys = {'Data', 'Links'}
-        actual_keys = set(content.keys())
-        non_ipfs_keys = actual_keys - ipfs_internal_keys
-
-        has_tokens = any(k not in ('_meta', 'Data', 'Links') for k in content.keys())
-        has_meta = '_meta' in content and isinstance(content.get('_meta'), dict)
-
-        if not has_tokens and not has_meta:
-            # Content appears empty or has only IPFS internal fields
-            if non_ipfs_keys:
-                # Has some custom keys but no tokens or meta - might be valid, log warning
-                logger.debug(f"CID {cid[:16]}... has custom keys but no tokens/_meta: {non_ipfs_keys}")
-            else:
-                # Only Data/Links - definitely empty
-                logger.warning(f"CID {cid[:16]}... appears empty (only Data/Links), not caching")
-                return None
-
-        await cache.set(cid, content)
-        return content
-
-    except httpx.TimeoutException:
-        logger.warning(f"CID fetch timeout for {cid[:16]}...")
-        return None
-    except json.JSONDecodeError as e:
-        logger.warning(f"CID content not valid JSON for {cid[:16]}...: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"CID fetch error for {cid[:16]}...: {e}")
-        return None
-
-
-def validate_meta_field(content: dict, is_bootstrap: bool = False) -> tuple[bool, str, Optional[str], Optional[int]]:
-    """
-    SECURITY: Validate _meta structure strictly.
-
-    Returns: (valid, reason, lastCid, version)
-
-    Requirements:
-    - _meta field MUST exist and be a dict
-    - version MUST exist and be a positive integer >= 1
-    - lastCid MUST exist for non-bootstrap records (can be null for bootstrap)
-    """
-    if '_meta' not in content:
-        return False, "missing_meta_field", None, None
-
-    meta = content.get('_meta')
-    if not isinstance(meta, dict):
-        return False, "meta_not_dict", None, None
-
-    version = meta.get('version')
-    if version is None:
-        return False, "missing_meta_version", None, None
-    if not isinstance(version, int):
-        return False, "version_not_int", None, None
-    if version < 1:
-        return False, "version_less_than_1", None, None
-
-    last_cid = meta.get('lastCid')
-
-    # For non-bootstrap records, lastCid must be explicitly present in _meta
-    # (it can be null/None for bootstrap, but the field should exist for updates)
-    if not is_bootstrap and 'lastCid' not in meta:
-        return False, "missing_meta_lastcid", None, version
-
-    return True, "valid", last_cid, version
+# CidContentCache, fetch_cid_content, and validate_meta_field have been
+# moved to the Go sidecar (/internal/validate-chain) to eliminate
+# pymalloc fragmentation from HTTP response / JSON decode allocations.
+# See go-sidecar/validate.go for the Go implementation.
 
 
 @dataclass
@@ -1047,210 +885,87 @@ async def validate_version_chain(
     """
     Validate that new CID maintains version chain integrity.
 
-    SECURITY HARDENED: All records MUST have valid _meta field.
+    Delegates to Go sidecar /internal/validate-chain to avoid CID fetch
+    allocations in Python (issue #19 — pymalloc fragmentation fix).
 
-    Rules:
-    1. First record (no current_cid): Accept if _meta.version >= 1 and no lastCid
-    2. Same CID (republish): Accept
-    3. New CID: Must have valid _meta with lastCid == current_cid AND version == current_version + 1
-    4. Large sequence jumps (>5): Require valid _meta but allow version >= current (for recovery)
-
-    Security notes:
-    - Missing _meta field: ALWAYS REJECTED
-    - CID fetch failure: ALWAYS REJECTED (no optimistic acceptance)
-    - log_only mode: REJECTS invalid records (only adds verbose forensics logging)
+    The Go sidecar handles all validation logic including:
+    - CID content fetching from kubo /api/v0/cat
+    - _meta field validation
+    - Chain link validation (lastCid == current CID)
+    - Version increment validation
+    - Forensic logging to chain_validation_log table
     """
 
     if not CHAIN_VALIDATION_ENABLED:
         metrics.chain_validations_skipped += 1
         return ChainValidationResult(valid=True, reason="validation_disabled")
 
-    # SECURITY FIX: Large sequence jumps NO LONGER bypass chain validation
-    # They still require valid _meta field but allow version >= current (not necessarily +1)
-    # This supports multi-device recovery while preventing corruption attacks
-    sequence_delta = new_sequence - current_sequence
-    is_large_jump = sequence_delta > 5
-    if is_large_jump:
-        logger.warning(
-            f"Large sequence jump detected for {ipns_name[:16]}...: "
-            f"{current_sequence} -> {new_sequence} (delta={sequence_delta}), still validating _meta"
-        )
-        # Continue to _meta validation below - DO NOT return early
+    go_url = os.getenv("GO_SIDECAR_URL", "http://127.0.0.1:9082")
+    payload = {
+        "ipns_name": ipns_name,
+        "new_cid": new_cid,
+        "current_cid": current_cid or "",
+        "new_sequence": new_sequence,
+        "current_sequence": current_sequence,
+        "current_version": current_version,
+    }
 
-    # Case 1: First record for this IPNS name
-    if current_cid is None:
-        # Fetch new CID to verify it's a valid bootstrap (no lastCid)
-        content = await fetch_cid_content(new_cid)
-        if content is None:
-            # SECURITY FIX: Always reject on fetch failure - no optimistic acceptance
-            logger.error(f"REJECTED: Cannot fetch bootstrap CID {new_cid[:16]}... for {ipns_name[:16]}...")
-            metrics.chain_validations_failed_fetch += 1
-            return ChainValidationResult(valid=False, reason="fetch_failed_bootstrap")
-
-        # SECURITY FIX: Validate _meta structure strictly
-        meta_valid, meta_reason, last_cid, version = validate_meta_field(content, is_bootstrap=True)
-        if not meta_valid:
-            logger.error(f"REJECTED: Invalid _meta for bootstrap {ipns_name[:16]}...: {meta_reason}")
-            _log_chain_violation(
-                db, ipns_name, f"invalid_meta_{meta_reason}",
-                None, new_cid, new_sequence, None, None
-            )
-            metrics.chain_validations_failed_break += 1
-            return ChainValidationResult(valid=False, reason=f"invalid_meta_{meta_reason}")
-
-        # Bootstrap record should NOT have lastCid (or it should be empty/null)
-        if last_cid:
-            logger.error(
-                f"CHAIN BREAK: Bootstrap record for {ipns_name[:16]}... has unexpected lastCid={last_cid[:16]}..."
-            )
-            _log_chain_violation(
-                db, ipns_name, "invalid_bootstrap",
-                None, new_cid, new_sequence, None, last_cid
-            )
-            metrics.chain_validations_failed_break += 1
-
-            # SECURITY FIX: log_only mode REJECTS invalid records (forensics only)
-            if CHAIN_VALIDATION_MODE == "log_only":
-                logger.error(
-                    f"REJECTED (forensics mode): Invalid bootstrap for {ipns_name[:16]}..."
-                )
-            return ChainValidationResult(valid=False, reason="invalid_bootstrap_lastcid")
-
-        metrics.chain_validations_passed += 1
-        # Bootstrap has no lastCid (it's the first version)
-        return ChainValidationResult(valid=True, reason="valid_bootstrap", last_cid=None, version=version)
-
-    # Case 2: Same CID (republish with higher sequence)
-    if new_cid == current_cid:
-        metrics.chain_validations_passed += 1
-        # Republish doesn't change the chain - preserve existing lastCid
-        return ChainValidationResult(valid=True, reason="republish", last_cid=current_cid, version=0)
-
-    # Case 3: New CID - validate chain continuity
-    content = await fetch_cid_content(new_cid)
-    if content is None:
-        # SECURITY FIX: Always reject on fetch failure - no optimistic acceptance
-        logger.error(f"REJECTED: Cannot fetch CID {new_cid[:16]}... for {ipns_name[:16]}...")
-        metrics.chain_validations_failed_fetch += 1
-        return ChainValidationResult(valid=False, reason="fetch_failed")
-
-    # SECURITY FIX: Validate _meta structure strictly
-    meta_valid, meta_reason, last_cid, version = validate_meta_field(content, is_bootstrap=False)
-    if not meta_valid:
-        logger.error(f"REJECTED: Invalid _meta for {ipns_name[:16]}...: {meta_reason}")
-        _log_chain_violation(
-            db, ipns_name, f"invalid_meta_{meta_reason}",
-            current_cid, new_cid, new_sequence, None, None
-        )
-        metrics.chain_validations_failed_break += 1
-
-        # SECURITY FIX: Large jump with missing _meta is especially suspicious
-        if is_large_jump:
-            logger.error(f"SECURITY: Large sequence jump with invalid _meta for {ipns_name[:16]}...")
-
-        return ChainValidationResult(valid=False, reason=f"invalid_meta_{meta_reason}")
-
-    # SECURITY FIX: Handle large sequence jumps specially for multi-device recovery
-    # Large jumps still require valid _meta but allow version >= current (not necessarily +1)
-    if is_large_jump:
-        # For recovery: require valid _meta but allow version >= current
-        if version < current_version:
-            logger.error(
-                f"REJECTED: Large jump with version regression for {ipns_name[:16]}...\n"
-                f"  Current version: {current_version}\n"
-                f"  New version:     {version}\n"
-                f"  Large jumps require version >= current"
-            )
-            _log_chain_violation(
-                db, ipns_name, "large_jump_version_regression",
-                current_cid, new_cid, new_sequence, str(current_version), str(version)
-            )
-            metrics.chain_validations_failed_break += 1
-            return ChainValidationResult(valid=False, reason="large_jump_version_regression")
-
-        # Large jump with valid _meta and version >= current: ACCEPT for recovery
-        logger.warning(
-            f"ACCEPTING large sequence jump for {ipns_name[:16]}...\n"
-            f"  Current version: {current_version}, New version: {version}\n"
-            f"  Sequence delta: {sequence_delta} (recovery scenario)"
-        )
-        metrics.chain_validations_passed += 1
-        return ChainValidationResult(valid=True, reason="valid_large_jump", last_cid=last_cid, version=version)
-
-    # Normal case: Validate chain - lastCid must equal current_cid
-    if last_cid != current_cid:
-        logger.error(
-            f"CHAIN BREAK DETECTED for {ipns_name[:16]}...\n"
-            f"  Current CID:      {current_cid}\n"
-            f"  New CID:          {new_cid}\n"
-            f"  New _meta.lastCid: {last_cid}\n"
-            f"  Expected lastCid to equal current CID!"
-        )
-        _log_chain_violation(
-            db, ipns_name, "chain_break",
-            current_cid, new_cid, new_sequence, current_cid, last_cid
-        )
-        metrics.chain_validations_failed_break += 1
-
-        # SECURITY FIX: log_only mode REJECTS invalid records (forensics only)
-        if CHAIN_VALIDATION_MODE == "log_only":
-            logger.error(f"REJECTED (forensics mode): Chain break for {ipns_name[:16]}...")
-
-        return ChainValidationResult(valid=False, reason="chain_break", last_cid=last_cid)
-
-    # Validate version number: new version must be exactly current_version + 1
-    expected_version = current_version + 1
-    if version != expected_version:
-        logger.error(
-            f"VERSION MISMATCH for {ipns_name[:16]}...\n"
-            f"  Current version:  {current_version}\n"
-            f"  Expected version: {expected_version}\n"
-            f"  Actual version:   {version}\n"
-            f"  Version must increment by exactly 1!"
-        )
-        _log_chain_violation(
-            db, ipns_name, "version_mismatch",
-            current_cid, new_cid, new_sequence, str(expected_version), str(version)
-        )
-        metrics.chain_validations_failed_break += 1
-
-        # SECURITY FIX: log_only mode REJECTS invalid records (forensics only)
-        if CHAIN_VALIDATION_MODE == "log_only":
-            logger.error(f"REJECTED (forensics mode): Version mismatch for {ipns_name[:16]}...")
-
-        return ChainValidationResult(valid=False, reason="version_mismatch", last_cid=last_cid, version=version)
-
-    logger.info(
-        f"CHAIN VALID: {ipns_name[:16]}... seq={new_sequence} v={version}"
-    )
-    metrics.chain_validations_passed += 1
-    return ChainValidationResult(valid=True, reason="valid_chain", last_cid=last_cid, version=version)
-
-
-def _log_chain_violation(
-    db: sqlite3.Connection,
-    ipns_name: str,
-    violation_type: str,
-    current_cid: Optional[str],
-    rejected_cid: str,
-    rejected_sequence: int,
-    expected_lastcid: Optional[str],
-    actual_lastcid: Optional[str]
-):
-    """Log chain validation violation for forensic analysis."""
     try:
-        cursor = db.cursor()
-        cursor.execute(
-            """INSERT INTO chain_validation_log
-               (ipns_name, violation_type, current_cid, rejected_cid,
-                rejected_sequence, expected_lastcid, actual_lastcid)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (ipns_name, violation_type, current_cid, rejected_cid,
-             rejected_sequence, expected_lastcid, actual_lastcid)
+        client = get_shared_http_client()
+        response = await client.post(
+            f"{go_url}/internal/validate-chain",
+            json=payload,
+            timeout=CID_FETCH_TIMEOUT + 5  # Go does the CID fetch; add margin
         )
-        db.commit()
+        try:
+            if response.status_code != 200:
+                logger.error(
+                    f"Go sidecar validate-chain returned {response.status_code} "
+                    f"for {ipns_name[:16]}..., rejecting"
+                )
+                metrics.chain_validations_failed_fetch += 1
+                return ChainValidationResult(valid=False, reason="sidecar_error")
+
+            try:
+                result = response.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Go sidecar returned invalid JSON for {ipns_name[:16]}...: {e}")
+                metrics.chain_validations_failed_fetch += 1
+                return ChainValidationResult(valid=False, reason="sidecar_invalid_response")
+        finally:
+            await response.aclose()
+
+        valid = result.get("valid", False)
+        reason = result.get("reason", "unknown")
+        last_cid = result.get("last_cid")
+        version = result.get("version")
+
+        if valid:
+            metrics.chain_validations_passed += 1
+        else:
+            # Categorize failure for metrics.
+            if "fetch_failed" in reason:
+                metrics.chain_validations_failed_fetch += 1
+            else:
+                metrics.chain_validations_failed_break += 1
+            logger.warning(
+                f"Chain validation rejected {ipns_name[:16]}...: {reason}"
+            )
+
+        return ChainValidationResult(
+            valid=valid,
+            reason=reason,
+            last_cid=last_cid,
+            version=version,
+        )
+
     except Exception as e:
-        logger.error(f"Failed to log chain violation: {e}")
+        logger.error(f"Go sidecar validate-chain error for {ipns_name[:16]}...: {e}")
+        metrics.chain_validations_failed_fetch += 1
+        return ChainValidationResult(valid=False, reason="sidecar_unavailable")
+
+
+# _log_chain_violation moved to Go sidecar (issue #19) — see go-sidecar/validate.go
 
 
 async def _log_forensic_event_async(

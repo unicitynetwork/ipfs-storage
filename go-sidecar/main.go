@@ -33,6 +33,8 @@ type Config struct {
 	RefreshInterval       time.Duration
 	RefreshBatchSize      int
 	MaxRefreshConcurrency int
+	ChainValidationEnabled bool
+	CIDFetchTimeout        int // seconds
 }
 
 func loadConfig() Config {
@@ -45,6 +47,8 @@ func loadConfig() Config {
 		MaxRefreshConcurrency: envOrInt("MAX_REFRESH_CONCURRENCY", 10),
 	}
 	c.RefreshInterval = time.Duration(envOrInt("REFRESH_INTERVAL_SECONDS", 10)) * time.Second
+	c.ChainValidationEnabled = envOr("CHAIN_VALIDATION_ENABLED", "true") == "true"
+	c.CIDFetchTimeout = envOrInt("CID_FETCH_TIMEOUT", 10)
 	return c
 }
 
@@ -116,6 +120,7 @@ func main() {
 	mux.HandleFunc("/routing-get", handler.RoutingGet)
 	mux.HandleFunc("/ws/ipns", subMgr.HandleWebSocket)
 	mux.HandleFunc("/internal/ws-notify", handler.WSNotify)
+	mux.HandleFunc("/internal/validate-chain", handler.ValidateChain)
 	mux.HandleFunc("/health", handler.Health)
 
 	srv := &http.Server{
@@ -134,7 +139,7 @@ func main() {
 	go refresher.Run(ctx)
 
 	go func() {
-		log.Printf("Go sidecar listening on %s (routing-get, ws/ipns, ws-notify)", cfg.ListenAddr)
+		log.Printf("Go sidecar listening on %s (routing-get, ws/ipns, ws-notify, validate-chain)", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
